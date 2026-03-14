@@ -1,0 +1,10 @@
+# Config (contains bot token and personal settings)
+copilot_bot_config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Headless server temp files
+headless_*.txt
