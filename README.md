@@ -1,6 +1,16 @@
-# Copilot Session Tools
+# Copilot Telegram Bot and Session Tools
 
-Tools for enumerating and interacting with local [GitHub Copilot CLI](https://githubnext.com/projects/copilot-cli) sessions from the command line or via Telegram.
+We've all been there: Sometimes you've been agenting all day and just want to chill on the sofa... but you have to interact with one of your sessions every now and then. And you don't want to leave the sofa. Or you need to get your work done with the patchy connection on the London Tube before you reach office/home. 
+With this *simple* and *inherently unsafe* tool, you can access your host's local sessions and interact with them using Telegram. 
+
+## no further dependencies
+Only python-telegram-bot and copilot-sdk are needed. No need for openclaw or any other seafood. 
+
+## your sessions come from home
+You set up your sessions on your host -- access rights etc included. 
+
+## no warranty
+This is obviously a quick solution to an inherent problem and soon other approaches will prevail. However, in the meantime, have fun and send PRs!
 
 ## Prerequisites
 
@@ -24,36 +34,6 @@ python copilot_telegram_bot.py
 ```
 
 ## Scripts
-
-### `copilot_sessions.py` — Session Enumeration
-
-Lists all Copilot CLI sessions on your device by scanning the local session state directory, SQLite database, and optionally querying the SDK.
-
-```bash
-# List all sessions
-python copilot_sessions.py
-
-# Only active (currently connected) sessions
-python copilot_sessions.py --active
-
-# JSON output
-python copilot_sessions.py --json
-
-# Verbose (full session IDs, extra details)
-python copilot_sessions.py --verbose
-
-# Query via headless SDK server (richer metadata)
-python copilot_sessions.py --use-sdk
-
-# SDK only (skip filesystem/DB scan)
-python copilot_sessions.py --sdk-only
-```
-
-**Data sources:**
-1. `~/.copilot/session-state/*/workspace.yaml` — session metadata
-2. `~/.copilot/session-state/*/inuse.*.lock` — active session detection (PID cross-reference)
-3. `~/.copilot/session-store.db` — historical session data (SQLite)
-4. Copilot SDK `session.list` RPC via headless server (`--use-sdk`)
 
 ### `copilot_telegram_bot.py` — Telegram Bot
 
@@ -150,3 +130,35 @@ The bot starts a headless Copilot CLI server via the Python SDK. The SDK communi
 - The bot auto-repairs a known Copilot CLI bug where `"attachments": null` in session event files causes resume failures.
 - Session switching changes the bot process's working directory to match the session's `cwd`.
 - The `.gitignore` excludes `copilot_bot_config.json` to prevent committing your bot token.
+
+### `copilot_sessions.py` — Session Enumeration
+
+Lists all Copilot CLI sessions on your device by scanning the local session state directory, SQLite database, and optionally querying the SDK.
+
+```bash
+# List all sessions
+python copilot_sessions.py
+
+# Only active (currently connected) sessions
+python copilot_sessions.py --active
+
+# JSON output
+python copilot_sessions.py --json
+
+# Verbose (full session IDs, extra details)
+python copilot_sessions.py --verbose
+
+# Query via headless SDK server (richer metadata)
+python copilot_sessions.py --use-sdk
+
+# SDK only (skip filesystem/DB scan)
+python copilot_sessions.py --sdk-only
+```
+
+**Data sources:**
+1. `~/.copilot/session-state/*/workspace.yaml` — session metadata
+2. `~/.copilot/session-state/*/inuse.*.lock` — active session detection (PID cross-reference)
+3. `~/.copilot/session-store.db` — historical session data (SQLite)
+4. Copilot SDK `session.list` RPC via headless server (`--use-sdk`)
+
+
