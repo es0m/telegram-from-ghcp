@@ -6,10 +6,21 @@ Tools for enumerating and interacting with local [GitHub Copilot CLI](https://gi
 
 - Python 3.11+
 - [Copilot CLI](https://github.com/github/copilot-cli) installed and authenticated (`copilot auth login`)
-- pip packages:
+
+### Install dependencies
+
+**With [uv](https://docs.astral.sh/uv/) (recommended)** — no install step needed. Both scripts include [PEP 723](https://peps.python.org/pep-0723/) inline metadata, so `uv run` handles everything:
 
 ```bash
-pip install github-copilot-sdk python-telegram-bot
+uv run copilot_telegram_bot.py
+uv run copilot_sessions.py --active
+```
+
+**With pip:**
+
+```bash
+pip install -r requirements.txt
+python copilot_telegram_bot.py
 ```
 
 ## Scripts
@@ -116,7 +127,8 @@ Config file search order:
 
 3. **Run the bot:**
    ```bash
-   python copilot_telegram_bot.py
+   uv run copilot_telegram_bot.py
+   # or: python copilot_telegram_bot.py
    ```
 
 4. **Open your bot in Telegram** and send `/active` to see recent sessions, then tap one to connect.

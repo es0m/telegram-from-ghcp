@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "github-copilot-sdk>=0.1.0",
+# ]
+# ///
 """
 copilot-sessions: Enumerate all Copilot CLI sessions on this device.
 
