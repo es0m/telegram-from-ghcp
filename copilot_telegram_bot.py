@@ -16,6 +16,7 @@ session events to a Telegram chat in real time.
 Commands:
   /start         — Welcome message and usage help
   /list          — List all sessions (active ones highlighted)
+  /active [days] — Show sessions active in the last N days (default: 7)
   /switch <id>   — Connect to a session and subscribe to its events
   /status        — Show current session info
   /send <msg>    — Send a prompt to the current session
