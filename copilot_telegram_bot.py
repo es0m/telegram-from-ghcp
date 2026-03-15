@@ -41,7 +41,7 @@ import os
 import shutil
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -161,6 +161,19 @@ def is_authorized(update: Update) -> bool:
 
 async def ensure_client() -> CopilotClient:
     """Ensure the Copilot client is started and connected."""
+    if state.client is not None:
+        # Check if existing client is still healthy
+        try:
+            if state.client.get_state() != "connected":
+                logger.warning("Client in bad state, restarting...")
+                try:
+                    await state.client.stop()
+                except Exception:
+                    pass
+                state.client = None
+        except Exception:
+            state.client = None
+
     if state.client is None:
         cli_path = state.config.get("copilot_cli_path", "copilot")
         log_level = state.config.get("copilot_log_level", "none")
@@ -306,6 +319,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "monitor and interact with them via Telegram.\n\n"
         "<b>Commands:</b>\n"
         "/list — List all sessions\n"
+        "/active [days] — Recent sessions (default: 7 days)\n"
         "/switch &lt;id&gt; — Connect to a session\n"
         "/status — Current session info\n"
         "/send &lt;message&gt; — Send a prompt\n"
@@ -355,7 +369,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Inline keyboard button to switch to this session
             btn_label = f"{sid_short} — {(s.summary or '—')[:30]}"
-            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"switch:{sid_short}")])
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"switch:{s.sessionId}")])
 
         if len(sessions) > 20:
             lines.append(f"\n<i>...and {len(sessions) - 20} more</i>")
@@ -371,6 +385,148 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error listing sessions: {e}")
         await update.message.reply_text(f"❌ Error: {escape(str(e))}", parse_mode=ParseMode.HTML)
+
+
+async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /active [days] — list sessions active within the last N days."""
+    if not is_authorized(update):
+        return
+
+    days = 7
+    if context.args:
+        try:
+            days = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Usage: /active [days]  (default: 7)")
+            return
+
+    try:
+        client = await ensure_client()
+        sessions = await client.list_sessions()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        recent = []
+        for s in sessions:
+            if s.modifiedTime:
+                try:
+                    mod = datetime.fromisoformat(s.modifiedTime.replace("Z", "+00:00"))
+                    if mod >= cutoff:
+                        recent.append(s)
+                except Exception:
+                    pass
+
+        recent.sort(key=lambda s: s.modifiedTime or "", reverse=True)
+
+        if not recent:
+            await update.message.reply_text(f"No sessions active in the last {days} day(s).")
+            return
+
+        lines = [f"📋 <b>Active Sessions</b> (last {days}d): {len(recent)}\n"]
+        buttons = []
+        for s in recent[:20]:
+            sid_short = s.sessionId[:8]
+            summary = (s.summary or "—")[:60]
+            age = format_time_ago(s.modifiedTime)
+            cwd = ""
+            if s.context and s.context.cwd:
+                cwd = s.context.cwd.split("\\")[-1] or s.context.cwd.split("/")[-1]
+                cwd = f" 📁{cwd}"
+
+            marker = "▶️" if s.sessionId == state.current_session_id else "  "
+            lines.append(
+                f"{marker}<code>{sid_short}</code> {escape(summary)}"
+                f"\n    <i>{age}{cwd}</i>"
+            )
+
+            btn_label = f"{sid_short} — {(s.summary or '—')[:30]}"
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"switch:{s.sessionId}")])
+
+        if len(recent) > 20:
+            lines.append(f"\n<i>...and {len(recent) - 20} more</i>")
+
+        keyboard = InlineKeyboardMarkup(buttons) if buttons else None
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+    except Exception as e:
+        logger.error(f"Error listing active sessions: {e}")
+        await update.message.reply_text(f"❌ Error: {escape(str(e))}", parse_mode=ParseMode.HTML)
+
+
+def _chdir_to_session(meta) -> None:
+    """Change the process working directory to the session's cwd."""
+    if meta and meta.context and meta.context.cwd:
+        target = meta.context.cwd
+        if os.path.isdir(target):
+            os.chdir(target)
+            logger.info(f"Changed directory to {target}")
+        else:
+            logger.warning(f"Session cwd does not exist: {target}")
+
+
+def _repair_session_file(session_id: str) -> bool:
+    """Fix known corruption in session events.jsonl (null attachments → []).
+
+    Returns True if a repair was made.
+    """
+    session_dir = Path.home() / ".copilot" / "session-state" / session_id
+    events_file = session_dir / "events.jsonl"
+    if not events_file.is_file():
+        return False
+    try:
+        content = events_file.read_text(encoding="utf-8")
+        if '"attachments":null' not in content and '"attachments": null' not in content:
+            return False
+        import re
+        fixed = re.sub(r'"attachments"\s*:\s*null', '"attachments":[]', content)
+        events_file.write_text(fixed, encoding="utf-8")
+        logger.info(f"Repaired corrupted events.jsonl for session {session_id[:8]}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to repair session {session_id[:8]}: {e}")
+        return False
+
+
+async def _do_resume(session_id: str, chat_id: int) -> tuple:
+    """Shared logic for resuming a session (used by both /switch and button callback).
+
+    Returns (session, meta) on success.
+    Raises on failure.
+    """
+    async with state._lock:
+        client = await ensure_client()
+
+        if state.current_session:
+            await _disconnect_session()
+
+        # Pre-repair: fix known corruption before attempting resume
+        _repair_session_file(session_id)
+
+        config = ResumeSessionConfig(
+            on_permission_request=PermissionHandler.approve_all,
+        )
+        session = await client.resume_session(session_id, config)
+
+        state.current_session = session
+        state.current_session_id = session_id
+        state.event_chat_id = chat_id
+        state.unsubscribe_fn = session.on(on_session_event)
+
+        # Fetch metadata (non-critical)
+        meta = None
+        try:
+            sessions = await client.list_sessions()
+            meta = next((s for s in sessions if s.sessionId == session_id), None)
+            state.current_session_meta = meta
+        except Exception:
+            pass
+
+        _chdir_to_session(meta)
+        return session, meta
 
 
 async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -393,11 +549,7 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         client = await ensure_client()
 
-        # Disconnect existing session if any
-        if state.current_session:
-            await _disconnect_session()
-
-        # Find matching session
+        # Resolve prefix to full session ID
         sessions = await client.list_sessions()
         match = None
         for s in sessions:
@@ -418,28 +570,18 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Resume the session
         await update.message.reply_text(
             f"⏳ Connecting to session <code>{match.sessionId[:8]}</code>...",
             parse_mode=ParseMode.HTML,
         )
 
-        config = ResumeSessionConfig(
-            on_permission_request=PermissionHandler.approve_all,
-        )
-        session = await client.resume_session(match.sessionId, config)
+        _, meta = await _do_resume(match.sessionId, update.effective_chat.id)
+        meta = meta or match
 
-        # Subscribe to events
-        state.current_session = session
-        state.current_session_id = match.sessionId
-        state.current_session_meta = match
-        state.event_chat_id = update.effective_chat.id
-        state.unsubscribe_fn = session.on(on_session_event)
-
-        summary = escape(match.summary or "—")
+        summary = escape((meta.summary if meta else None) or "—")
         cwd = ""
-        if match.context and match.context.cwd:
-            cwd = f"\n📁 <code>{escape(match.context.cwd)}</code>"
+        if meta and meta.context and meta.context.cwd:
+            cwd = f"\n📁 <code>{escape(meta.context.cwd)}</code>"
 
         await update.message.reply_text(
             f"✅ Connected to session <code>{match.sessionId[:8]}</code>\n"
@@ -451,8 +593,11 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error switching session: {e}\n{traceback.format_exc()}")
+        hint = ""
+        if "corrupted" in str(e).lower() or "-32603" in str(e):
+            hint = "\n\n💡 The session file may be corrupted. Try a different session."
         await update.message.reply_text(
-            f"❌ Error connecting: {escape(str(e))}",
+            f"❌ Error connecting: {escape(str(e))}{hint}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -584,52 +729,39 @@ async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    target_prefix = data.removeprefix("switch:").lower().strip()
-    await query.answer(f"Connecting to {target_prefix}...")
+    session_id = data.removeprefix("switch:")
+    await query.answer(f"Connecting to {session_id[:8]}...")
 
     try:
-        client = await ensure_client()
+        # If callback data is a short prefix (from older /list messages),
+        # resolve it to the full session ID first.
+        if len(session_id) < 36:
+            client = await ensure_client()
+            sessions = await client.list_sessions()
+            matches = [s for s in sessions if s.sessionId.lower().startswith(session_id.lower())]
+            if len(matches) == 0:
+                await query.edit_message_text(
+                    f"❌ No session matching <code>{escape(session_id)}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            if len(matches) > 1:
+                await query.edit_message_text(
+                    f"❌ Ambiguous prefix <code>{escape(session_id)}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            session_id = matches[0].sessionId
 
-        if state.current_session:
-            await _disconnect_session()
+        _, meta = await _do_resume(session_id, query.message.chat_id)
 
-        sessions = await client.list_sessions()
-        match = None
-        for s in sessions:
-            if s.sessionId.lower().startswith(target_prefix):
-                if match is not None:
-                    await query.edit_message_text(
-                        f"❌ Ambiguous prefix <code>{escape(target_prefix)}</code>",
-                        parse_mode=ParseMode.HTML,
-                    )
-                    return
-                match = s
-
-        if match is None:
-            await query.edit_message_text(
-                f"❌ No session matching <code>{escape(target_prefix)}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        config = ResumeSessionConfig(
-            on_permission_request=PermissionHandler.approve_all,
-        )
-        session = await client.resume_session(match.sessionId, config)
-
-        state.current_session = session
-        state.current_session_id = match.sessionId
-        state.current_session_meta = match
-        state.event_chat_id = query.message.chat_id
-        state.unsubscribe_fn = session.on(on_session_event)
-
-        summary = escape(match.summary or "—")
+        summary = escape((meta.summary if meta else None) or "—")
         cwd = ""
-        if match.context and match.context.cwd:
-            cwd = f"\n📁 <code>{escape(match.context.cwd)}</code>"
+        if meta and meta.context and meta.context.cwd:
+            cwd = f"\n📁 <code>{escape(meta.context.cwd)}</code>"
 
         await query.edit_message_text(
-            f"✅ Connected to session <code>{match.sessionId[:8]}</code>\n"
+            f"✅ Connected to session <code>{session_id[:8]}</code>\n"
             f"📝 {summary}{cwd}\n\n"
             f"Session events will be forwarded here.\n"
             f"Use /send &lt;message&gt; to interact.",
@@ -638,10 +770,16 @@ async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error switching via button: {e}\n{traceback.format_exc()}")
-        await query.edit_message_text(
-            f"❌ Error connecting: {escape(str(e))}",
-            parse_mode=ParseMode.HTML,
-        )
+        hint = ""
+        if "corrupted" in str(e).lower() or "-32603" in str(e):
+            hint = "\n\n💡 Session file may be corrupted. Try a different session."
+        try:
+            await query.edit_message_text(
+                f"❌ Error connecting: {escape(str(e))}{hint}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -766,6 +904,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("active", cmd_active))
     app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("send", cmd_send))
