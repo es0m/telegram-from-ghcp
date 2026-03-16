@@ -762,12 +762,31 @@ def _repair_session_file(session_id: str) -> bool:
         orphaned = requested_ids - completed_ids
         if orphaned:
             import uuid as _uuid
+            from datetime import datetime, timezone
 
+            # Find parentId for each orphaned tool call (from tool.execution_start)
+            start_ids: dict[str, str] = {}  # toolCallId -> event id
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("type") == "tool.execution_start":
+                    tid = evt.get("data", {}).get("toolCallId")
+                    eid = evt.get("id", "")
+                    if tid and eid:
+                        start_ids[tid] = eid
+
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             extra_lines = []
             for tid in orphaned:
                 synthetic = json.dumps({
                     "type": "tool.execution_complete",
                     "id": str(_uuid.uuid4()),
+                    "timestamp": now_iso,
+                    "parentId": start_ids.get(tid, str(_uuid.uuid4())),
                     "data": {
                         "toolCallId": tid,
                         "model": "unknown",
