@@ -539,22 +539,45 @@ def _chdir_to_session(meta) -> None:
 
 
 def _repair_session_file(session_id: str) -> bool:
-    """Fix known corruption in session events.jsonl (null attachments → []).
+    """Fix known corruption in session events.jsonl.
+
+    Repairs:
+    - "attachments": null → "attachments": []
+    - File attachments missing required "displayName" field
 
     Returns True if a repair was made.
     """
+    import re as _re
+
     session_dir = Path.home() / ".copilot" / "session-state" / session_id
     events_file = session_dir / "events.jsonl"
     if not events_file.is_file():
         return False
     try:
         content = events_file.read_text(encoding="utf-8")
-        if '"attachments":null' not in content and '"attachments": null' not in content:
+        original = content
+
+        # Fix null attachments
+        content = _re.sub(r'"attachments"\s*:\s*null', '"attachments":[]', content)
+
+        # Fix file attachments missing displayName:
+        # {"type":"file","path":"..."} → {"type":"file","path":"...","displayName":"filename"}
+        def _add_display_name(m):
+            path = m.group(1)
+            basename = path.replace("\\\\", "/").split("/")[-1] or "file"
+            return f'{{"type":"file","path":"{path}","displayName":"{basename}"}}'
+
+        content = _re.sub(
+            r'\{"type"\s*:\s*"file"\s*,\s*"path"\s*:\s*"([^"]+)"\s*\}',
+            _add_display_name,
+            content,
+        )
+
+        if content == original:
             return False
-        import re
-        fixed = re.sub(r'"attachments"\s*:\s*null', '"attachments":[]', content)
-        events_file.write_text(fixed, encoding="utf-8")
-        logger.info(f"Repaired corrupted events.jsonl for session {session_id[:8]}")
+
+        events_file.write_text(content, encoding="utf-8")
+        logger.info(f"Repaired events.jsonl for session {session_id[:8]}")
         return True
     except Exception as e:
         logger.warning(f"Failed to repair session {session_id[:8]}: {e}")
@@ -907,7 +930,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(tmp_path)
         logger.info(f"Downloaded photo to {tmp_path} ({photo.width}x{photo.height})")
 
-        attachment = {"type": "file", "path": tmp_path}
+        attachment = {"type": "file", "path": tmp_path, "displayName": os.path.basename(tmp_path)}
         message_id = await state.current_session.send(
             MessageOptions(prompt=caption, attachments=[attachment])
         )
