@@ -3,6 +3,8 @@
 We've all been there: Sometimes you've been agenting all day and just want to chill on the sofa... but you have to interact with one of your sessions every now and then. And you don't want to leave the sofa. Or you need to get your work done with the patchy connection on the London Tube before you reach office/home. 
 With this *simple* and *inherently unsafe* tool, you can access your host's local sessions and interact with them using Telegram. 
 
+![Telegram bot screenshot — sending a photo to a Copilot session](telegram_bot_photo.jpg)
+
 ## no further dependencies
 Only python-telegram-bot and copilot-sdk are needed. No need for openclaw or any other seafood. 
 
