@@ -737,6 +737,9 @@ def _repair_session_file(session_id: str) -> bool:
         # Fix orphaned tool_use blocks (tool calls without matching tool_result).
         # Parse events to find toolCallIds from assistant.message toolRequests
         # that have no corresponding tool.execution_complete event.
+        # Fix orphaned tool_use blocks by inserting synthetic tool.execution_complete
+        # RIGHT AFTER the corresponding tool.execution_start (not at end of file).
+        # Claude's API requires tool_result immediately after tool_use in message order.
         lines = content.rstrip("\n").split("\n")
         requested_ids: set[str] = set()
         completed_ids: set[str] = set()
@@ -764,9 +767,29 @@ def _repair_session_file(session_id: str) -> bool:
             import uuid as _uuid
             from datetime import datetime, timezone
 
-            # Find parentId for each orphaned tool call (from tool.execution_start)
-            start_ids: dict[str, str] = {}  # toolCallId -> event id
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+            # Also remove any previous synthetic repairs (interactionId=repair)
+            # that were appended at the wrong position
+            cleaned_lines = []
             for line in lines:
+                if not line.strip():
+                    cleaned_lines.append(line)
+                    continue
+                try:
+                    evt = json.loads(line)
+                    if (evt.get("type") == "tool.execution_complete"
+                            and evt.get("data", {}).get("interactionId") == "repair"):
+                        continue  # remove old misplaced synthetic
+                except json.JSONDecodeError:
+                    pass
+                cleaned_lines.append(line)
+            lines = cleaned_lines
+
+            # Insert synthetic completions right after tool.execution_start
+            new_lines = []
+            for line in lines:
+                new_lines.append(line)
                 if not line.strip():
                     continue
                 try:
@@ -775,30 +798,26 @@ def _repair_session_file(session_id: str) -> bool:
                     continue
                 if evt.get("type") == "tool.execution_start":
                     tid = evt.get("data", {}).get("toolCallId")
-                    eid = evt.get("id", "")
-                    if tid and eid:
-                        start_ids[tid] = eid
+                    if tid and tid in orphaned:
+                        parent_id = evt.get("id", str(_uuid.uuid4()))
+                        synthetic = json.dumps({
+                            "type": "tool.execution_complete",
+                            "id": str(_uuid.uuid4()),
+                            "timestamp": now_iso,
+                            "parentId": parent_id,
+                            "data": {
+                                "toolCallId": tid,
+                                "model": "unknown",
+                                "interactionId": "repair",
+                                "success": False,
+                                "result": {
+                                    "content": "[Tool execution was interrupted]",
+                                },
+                            },
+                        })
+                        new_lines.append(synthetic)
 
-            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            extra_lines = []
-            for tid in orphaned:
-                synthetic = json.dumps({
-                    "type": "tool.execution_complete",
-                    "id": str(_uuid.uuid4()),
-                    "timestamp": now_iso,
-                    "parentId": start_ids.get(tid, str(_uuid.uuid4())),
-                    "data": {
-                        "toolCallId": tid,
-                        "model": "unknown",
-                        "interactionId": "repair",
-                        "success": False,
-                        "result": {
-                            "content": "[Tool execution was interrupted — no result recorded]",
-                        },
-                    },
-                })
-                extra_lines.append(synthetic)
-            content = content.rstrip("\n") + "\n" + "\n".join(extra_lines) + "\n"
+            content = "\n".join(new_lines) + "\n"
             logger.info(
                 f"Injected {len(orphaned)} synthetic tool_result(s) for session {session_id[:8]}"
             )
