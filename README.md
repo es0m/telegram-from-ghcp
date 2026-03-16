@@ -52,6 +52,8 @@ A Telegram bot that connects to local Copilot sessions as an additional "head" u
 
 Plain text messages are forwarded as prompts when connected to a session.
 
+**Photos:** Send a photo to the chat and it will be forwarded to the session as an image attachment. Add a caption to use as the prompt (default: "Describe this image").
+
 **Event streaming:** When connected, the bot forwards session events to your Telegram chat in real time — assistant messages, tool executions, intent updates, errors, and more.
 
 ## Configuration

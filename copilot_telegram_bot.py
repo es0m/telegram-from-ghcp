@@ -23,6 +23,9 @@ Commands:
   /disconnect    — Disconnect from current session
   /help          — Show available commands
 
+  Photos sent to the chat are forwarded to the session as image attachments.
+  The photo caption is used as the prompt (default: "Describe this image").
+
 Environment:
   TELEGRAM_BOT_TOKEN   — Required. Your Telegram bot token from @BotFather
   COPILOT_CLI_PATH     — Optional. Path to copilot binary (default: "copilot")
@@ -48,6 +51,7 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -817,6 +821,59 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages — download and send to session as a file attachment."""
+    if not is_authorized(update):
+        return
+
+    if state.current_session is None:
+        await update.message.reply_text(
+            "No active session. Use /switch to connect first.",
+        )
+        return
+
+    photo = update.message.photo[-1]  # highest resolution
+    caption = update.message.caption or "Describe this image"
+
+    try:
+        file = await photo.get_file()
+
+        # Download to a temp file that persists until the session processes it
+        suffix = ".jpg"
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=suffix, prefix="copilot_photo_", delete=False
+        )
+        tmp_path = tmp.name
+        tmp.close()
+
+        await file.download_to_drive(tmp_path)
+        logger.info(f"Downloaded photo to {tmp_path} ({photo.width}x{photo.height})")
+
+        attachment = {"type": "file", "path": tmp_path}
+        message_id = await state.current_session.send(
+            MessageOptions(prompt=caption, attachments=[attachment])
+        )
+        logger.info(f"Sent photo + prompt to session {state.current_session_id[:8]}")
+        await update.message.reply_text(f"📤 Sent photo with: {escape(caption)}", parse_mode=ParseMode.HTML)
+
+        # Clean up after a delay to give the server time to read the file
+        async def _cleanup():
+            await asyncio.sleep(30)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        asyncio.create_task(_cleanup())
+
+    except Exception as e:
+        logger.error(f"Error sending photo: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text(
+            f"❌ Error sending photo: {escape(str(e))}",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 # ── Application Lifecycle ───────────────────────────────────────────────────
 
 async def post_init(application: Application):
@@ -923,6 +980,9 @@ def main():
 
     # Handle plain text messages as prompts when connected
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Handle photo messages as image attachments
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     logger.info("Starting Copilot Sessions Telegram Bot...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
