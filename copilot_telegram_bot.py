@@ -4,6 +4,7 @@
 # dependencies = [
 #     "github-copilot-sdk>=0.1.0",
 #     "python-telegram-bot>=22.0",
+#     "faster-whisper>=1.1.0",
 # ]
 # ///
 """
@@ -25,6 +26,8 @@ Commands:
 
   Photos sent to the chat are forwarded to the session as image attachments.
   The photo caption is used as the prompt (default: "Describe this image").
+
+  Voice messages are transcribed locally using faster-whisper and sent as text.
 
 Environment:
   TELEGRAM_BOT_TOKEN   — Required. Your Telegram bot token from @BotFather
@@ -701,6 +704,7 @@ def _repair_session_file(session_id: str) -> bool:
     Repairs:
     - "attachments": null → "attachments": []
     - File attachments missing required "displayName" field
+    - Orphaned tool_use without tool_result (adds synthetic completion events)
 
     Returns True if a repair was made.
     """
@@ -729,6 +733,53 @@ def _repair_session_file(session_id: str) -> bool:
             _add_display_name,
             content,
         )
+
+        # Fix orphaned tool_use blocks (tool calls without matching tool_result).
+        # Parse events to find toolCallIds from assistant.message toolRequests
+        # that have no corresponding tool.execution_complete event.
+        lines = content.rstrip("\n").split("\n")
+        requested_ids: set[str] = set()
+        completed_ids: set[str] = set()
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = evt.get("type", "")
+            data = evt.get("data", {})
+            if etype == "assistant.message":
+                for req in data.get("toolRequests", []):
+                    tid = req.get("toolCallId")
+                    if tid:
+                        requested_ids.add(tid)
+            elif etype == "tool.execution_complete":
+                tid = data.get("toolCallId")
+                if tid:
+                    completed_ids.add(tid)
+
+        orphaned = requested_ids - completed_ids
+        if orphaned:
+            extra_lines = []
+            for tid in orphaned:
+                synthetic = json.dumps({
+                    "type": "tool.execution_complete",
+                    "data": {
+                        "toolCallId": tid,
+                        "model": "unknown",
+                        "interactionId": "repair",
+                        "success": False,
+                        "result": {
+                            "content": "[Tool execution was interrupted — no result recorded]",
+                        },
+                    },
+                })
+                extra_lines.append(synthetic)
+            content = content.rstrip("\n") + "\n" + "\n".join(extra_lines) + "\n"
+            logger.info(
+                f"Injected {len(orphaned)} synthetic tool_result(s) for session {session_id[:8]}"
+            )
 
         if content == original:
             return False
@@ -1144,6 +1195,86 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ── Voice Transcription ────────────────────────────────────────────────────
+
+_whisper_model = None
+
+
+def _get_whisper_model():
+    """Lazy-load the faster-whisper model (downloads on first use)."""
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        logger.info("Loading faster-whisper model (base)...")
+        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+        logger.info("Whisper model loaded")
+    return _whisper_model
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages — transcribe locally and send to session."""
+    if not is_authorized(update):
+        return
+
+    if state.current_session is None:
+        await update.message.reply_text(
+            "No active session. Use /switch to connect first.",
+        )
+        return
+
+    try:
+        voice = update.message.voice or update.message.audio
+        if voice is None:
+            return
+
+        file = await voice.get_file()
+
+        # Download to temp file
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".ogg", prefix="copilot_voice_", delete=False
+        )
+        tmp_path = tmp.name
+        tmp.close()
+        await file.download_to_drive(tmp_path)
+        logger.info(f"Downloaded voice to {tmp_path} ({voice.duration}s)")
+
+        await update.message.reply_text("🎙️ Transcribing...")
+
+        # Transcribe in a thread to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        model = _get_whisper_model()
+        segments, info = await loop.run_in_executor(
+            None, lambda: model.transcribe(tmp_path, beam_size=5)
+        )
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+        if not text:
+            await update.message.reply_text("⚠️ Could not transcribe any speech.")
+            return
+
+        # Show transcription and send to session
+        await update.message.reply_text(
+            f'🎙️ "<i>{escape(text)}</i>"\n📤 Sending to session...',
+            parse_mode=ParseMode.HTML,
+        )
+
+        message_id = await state.current_session.send(MessageOptions(prompt=text))
+        logger.info(f"Sent voice transcription ({len(text)} chars) as message {message_id}")
+
+    except Exception as e:
+        logger.error(f"Error handling voice: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text(
+            f"❌ Error: {escape(str(e))}",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 # ── Application Lifecycle ───────────────────────────────────────────────────
 
 async def post_init(application: Application):
@@ -1261,6 +1392,9 @@ def main():
 
     # Handle photo messages as image attachments
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # Handle voice messages — transcribe and send as text
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
     logger.info("Starting Copilot Sessions Telegram Bot...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
