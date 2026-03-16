@@ -201,6 +201,22 @@ class BotState:
         self._lock = asyncio.Lock()
         # Event loop reference for thread-safe callbacks
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Background session watchers: session_id → WatchedSession
+        self.watched_sessions: dict[str, "WatchedSession"] = {}
+
+
+class WatchedSession:
+    """Tracks a background-watched session."""
+
+    def __init__(self, session_id: str, summary: str, session: CopilotSession,
+                 unsub: callable):
+        self.session_id = session_id
+        self.summary = summary
+        self.session = session
+        self.unsub = unsub
+        self.unread_count: int = 0
+        self.last_event_summary: str = ""
+        self.notified: bool = False  # True if we already sent a notification
 
 
 state = BotState()
@@ -259,6 +275,139 @@ async def ensure_client() -> CopilotClient:
 
 
 # ── Event Handler ────────────────────────────────────────────────────────────
+
+# Events worth notifying about for background sessions
+_NOTIFY_EVENTS = {
+    SessionEventType.SESSION_IDLE.value,
+    SessionEventType.SESSION_ERROR.value,
+    SessionEventType.SESSION_TASK_COMPLETE.value,
+    SessionEventType.SESSION_WARNING.value,
+    SessionEventType.ASSISTANT_MESSAGE.value,
+}
+
+
+def _make_background_handler(session_id: str):
+    """Create an event handler for a background-watched session."""
+
+    def handler(event: SessionEvent):
+        if state._loop is None or state.app is None or state.event_chat_id is None:
+            return
+        watched = state.watched_sessions.get(session_id)
+        if not watched:
+            return
+        # Don't track events for the currently active session
+        if session_id == state.current_session_id:
+            return
+
+        event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+        if event_type not in _NOTIFY_EVENTS:
+            return
+
+        watched.unread_count += 1
+
+        # Build a short summary of the event
+        data = event.data
+        if event_type == SessionEventType.ASSISTANT_MESSAGE.value:
+            content = (getattr(data, "content", None) or "").strip()
+            if content:
+                watched.last_event_summary = content[:80]
+        elif event_type == SessionEventType.SESSION_IDLE.value:
+            watched.last_event_summary = "Session idle — ready for input"
+        elif event_type == SessionEventType.SESSION_ERROR.value:
+            watched.last_event_summary = getattr(data, "message", "Error") or "Error"
+        elif event_type == SessionEventType.SESSION_TASK_COMPLETE.value:
+            watched.last_event_summary = "Task complete"
+
+        # Send one notification per batch (when session becomes idle or errors)
+        if event_type in {
+            SessionEventType.SESSION_IDLE.value,
+            SessionEventType.SESSION_ERROR.value,
+            SessionEventType.SESSION_TASK_COMPLETE.value,
+        } and not watched.notified:
+            watched.notified = True
+            asyncio.run_coroutine_threadsafe(
+                _notify_background_update(session_id), state._loop
+            )
+
+    return handler
+
+
+async def _notify_background_update(session_id: str):
+    """Send a notification about a background session update."""
+    watched = state.watched_sessions.get(session_id)
+    if not watched or not state.event_chat_id or not state.app:
+        return
+    # Don't notify about the currently active session
+    if session_id == state.current_session_id:
+        watched.unread_count = 0
+        watched.notified = False
+        return
+
+    sid_short = session_id[:8]
+    summary = escape(watched.summary or "—")
+    last = escape(truncate(watched.last_event_summary, 100))
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Switch to {sid_short}", callback_data=f"switch:{session_id}")]
+    ])
+
+    try:
+        await state.app.bot.send_message(
+            chat_id=state.event_chat_id,
+            text=f"🔔 <b>Background session update</b>\n"
+                 f"<code>{sid_short}</code> {summary}\n"
+                 f"📬 {watched.unread_count} new event(s)\n"
+                 f"💬 {last}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.error(f"Failed to send background notification: {e}")
+
+
+async def watch_active_sessions():
+    """Subscribe to events on recently active sessions for background notifications."""
+    try:
+        client = await ensure_client()
+        sessions = await client.list_sessions()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+
+        for s in sessions:
+            sid = s.sessionId
+            # Skip if already watching or is the current session
+            if sid in state.watched_sessions or sid == state.current_session_id:
+                continue
+            if not s.modifiedTime:
+                continue
+            try:
+                mod = datetime.fromisoformat(s.modifiedTime.replace("Z", "+00:00"))
+                if mod < cutoff:
+                    continue
+            except Exception:
+                continue
+
+            # Resume and subscribe
+            try:
+                _repair_session_file(sid)
+                config = ResumeSessionConfig(
+                    on_permission_request=PermissionHandler.approve_all,
+                )
+                session = await client.resume_session(sid, config)
+                handler = _make_background_handler(sid)
+                unsub = session.on(handler)
+                watched = WatchedSession(
+                    session_id=sid,
+                    summary=(s.summary or "—")[:60],
+                    session=session,
+                    unsub=unsub,
+                )
+                state.watched_sessions[sid] = watched
+            except Exception as e:
+                logger.debug(f"Could not watch session {sid[:8]}: {e}")
+
+        logger.info(f"Watching {len(state.watched_sessions)} background sessions")
+    except Exception as e:
+        logger.error(f"Error setting up background watchers: {e}")
+
 
 def on_session_event(event: SessionEvent):
     """
@@ -455,6 +604,10 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error listing sessions: {e}")
         await update.message.reply_text(f"❌ Error: {escape(str(e))}", parse_mode=ParseMode.HTML)
+        return
+
+    # Set up background watchers for recently active sessions
+    asyncio.create_task(watch_active_sessions())
 
 
 async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -525,6 +678,10 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error listing active sessions: {e}")
         await update.message.reply_text(f"❌ Error: {escape(str(e))}", parse_mode=ParseMode.HTML)
+        return
+
+    # Set up background watchers for recently active sessions
+    asyncio.create_task(watch_active_sessions())
 
 
 def _chdir_to_session(meta) -> None:
@@ -608,6 +765,14 @@ async def _do_resume(session_id: str, chat_id: int) -> tuple:
         state.current_session_id = session_id
         state.event_chat_id = chat_id
         state.unsubscribe_fn = session.on(on_session_event)
+
+        # Clear background watch for this session (it's now foreground)
+        watched = state.watched_sessions.pop(session_id, None)
+        if watched:
+            try:
+                watched.unsub()
+            except Exception:
+                pass
 
         # Fetch metadata (non-critical)
         meta = None
@@ -696,45 +861,69 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command — show current session info."""
+    """Handle /status command — show current session info and unread background sessions."""
     if not is_authorized(update):
         return
 
-    if state.current_session is None:
-        await update.message.reply_text(
-            "No active session. Use /switch to connect to one.",
-        )
-        return
+    lines = []
 
-    try:
-        meta = state.current_session_meta
-        lines = ["📊 <b>Current Session</b>\n"]
-        lines.append(f"<b>ID:</b> <code>{meta.sessionId}</code>")
-        lines.append(f"<b>Summary:</b> {escape(meta.summary or '—')}")
-        lines.append(f"<b>Modified:</b> {format_time_ago(meta.modifiedTime)}")
-
-        if meta.context:
-            if meta.context.cwd:
-                lines.append(f"<b>CWD:</b> <code>{escape(meta.context.cwd)}</code>")
-            if meta.context.repository:
-                lines.append(f"<b>Repo:</b> {escape(meta.context.repository)}")
-            if meta.context.branch:
-                lines.append(f"<b>Branch:</b> {escape(meta.context.branch)}")
-
-        # Get message history count
+    if state.current_session is not None and state.current_session_meta:
         try:
-            messages = await state.current_session.get_messages()
-            lines.append(f"<b>Events:</b> {len(messages)}")
-        except Exception:
-            pass
+            meta = state.current_session_meta
+            lines.append("📊 <b>Current Session</b>\n")
+            lines.append(f"<b>ID:</b> <code>{meta.sessionId}</code>")
+            lines.append(f"<b>Summary:</b> {escape(meta.summary or '—')}")
+            lines.append(f"<b>Modified:</b> {format_time_ago(meta.modifiedTime)}")
 
+            if meta.context:
+                if meta.context.cwd:
+                    lines.append(f"<b>CWD:</b> <code>{escape(meta.context.cwd)}</code>")
+                if meta.context.repository:
+                    lines.append(f"<b>Repo:</b> {escape(meta.context.repository)}")
+                if meta.context.branch:
+                    lines.append(f"<b>Branch:</b> {escape(meta.context.branch)}")
+
+            try:
+                messages = await state.current_session.get_messages()
+                lines.append(f"<b>Events:</b> {len(messages)}")
+            except Exception:
+                pass
+        except Exception as e:
+            lines.append(f"❌ Error reading session: {escape(str(e))}")
+    else:
+        lines.append("No active session. Use /switch to connect to one.")
+
+    # Show unread background sessions
+    unread = [w for w in state.watched_sessions.values()
+              if w.unread_count > 0 and w.session_id != state.current_session_id]
+    if unread:
+        unread.sort(key=lambda w: w.unread_count, reverse=True)
+        lines.append(f"\n📬 <b>Unread background sessions</b> ({len(unread)})\n")
+        buttons = []
+        for w in unread[:10]:
+            sid_short = w.session_id[:8]
+            last = escape(truncate(w.last_event_summary, 60))
+            lines.append(
+                f"  <code>{sid_short}</code> ({w.unread_count} new) {escape(w.summary)}"
+                f"\n    💬 <i>{last}</i>"
+            )
+            buttons.append([InlineKeyboardButton(
+                f"{sid_short} — {w.unread_count} new",
+                callback_data=f"switch:{w.session_id}",
+            )])
+
+        keyboard = InlineKeyboardMarkup(buttons) if buttons else None
         await update.message.reply_text(
             "\n".join(lines),
             parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
         )
-    except Exception as e:
+    else:
+        watching = len(state.watched_sessions)
+        if watching:
+            lines.append(f"\n👁️ Watching {watching} background session(s) — no unread updates.")
         await update.message.reply_text(
-            f"❌ Error: {escape(str(e))}",
+            "\n".join(lines),
             parse_mode=ParseMode.HTML,
         )
 
@@ -967,6 +1156,14 @@ async def post_init(application: Application):
 async def post_shutdown(application: Application):
     """Called during application shutdown."""
     logger.info("Shutting down...")
+    # Unsubscribe all background watchers
+    for watched in state.watched_sessions.values():
+        try:
+            watched.unsub()
+        except Exception:
+            pass
+    state.watched_sessions.clear()
+
     await _disconnect_session()
     if state.client:
         try:
