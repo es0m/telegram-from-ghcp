@@ -96,6 +96,55 @@ def escape(text: str) -> str:
     return html.escape(text or "")
 
 
+def md_to_telegram_html(text: str) -> str:
+    """Convert Markdown from Copilot responses to Telegram-compatible HTML.
+
+    Handles code blocks, inline code, bold, italic, and links.
+    Telegram HTML supports: <b>, <i>, <code>, <pre>, <a>.
+    """
+    import re
+
+    result = []
+    # Split on fenced code blocks first
+    parts = re.split(r"(```[\s\S]*?```)", text)
+
+    for part in parts:
+        if part.startswith("```") and part.endswith("```"):
+            # Fenced code block — extract language hint and code
+            inner = part[3:-3]
+            newline = inner.find("\n")
+            if newline >= 0:
+                lang = inner[:newline].strip()
+                code = inner[newline + 1:]
+            else:
+                lang = ""
+                code = inner
+            if lang:
+                result.append(f'<pre><code class="language-{html.escape(lang)}">{html.escape(code)}</code></pre>')
+            else:
+                result.append(f"<pre>{html.escape(code)}</pre>")
+        else:
+            # Process inline Markdown
+            chunk = html.escape(part)
+            # Inline code (must be before bold/italic to avoid conflicts)
+            chunk = re.sub(r"`([^`]+)`", r"<code>\1</code>", chunk)
+            # Bold: **text** or __text__
+            chunk = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", chunk)
+            chunk = re.sub(r"__(.+?)__", r"<b>\1</b>", chunk)
+            # Italic: *text* or _text_ (but not inside words with underscores)
+            chunk = re.sub(r"(?<!\w)\*([^*]+?)\*(?!\w)", r"<i>\1</i>", chunk)
+            chunk = re.sub(r"(?<!\w)_([^_]+?)_(?!\w)", r"<i>\1</i>", chunk)
+            # Links: [text](url)
+            chunk = re.sub(
+                r"\[([^\]]+)\]\(([^)]+)\)",
+                lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>',
+                chunk,
+            )
+            result.append(chunk)
+
+    return "".join(result)
+
+
 def truncate(text: str, max_len: int = 4000) -> str:
     """Truncate text to fit Telegram message limits."""
     if not text:
@@ -248,13 +297,22 @@ async def _forward_event(event: SessionEvent):
     try:
         msg = _format_event(event, event_type)
         if msg:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=msg,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                disable_notification=silent,
-            )
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    disable_notification=silent,
+                )
+            except Exception:
+                # HTML parse failed (malformed markdown conversion) — send as plain text
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    disable_web_page_preview=True,
+                    disable_notification=silent,
+                )
     except Exception as e:
         logger.error(f"Failed to forward event {event_type}: {e}")
 
@@ -267,7 +325,7 @@ def _format_event(event: SessionEvent, event_type: str) -> Optional[str]:
         content = getattr(data, "content", None) or ""
         if not content.strip():
             return None
-        return f"🤖 <b>Assistant</b>\n<pre>{escape(truncate(content))}</pre>"
+        return f"🤖 <b>Assistant</b>\n{md_to_telegram_html(truncate(content))}"
 
     elif event_type == SessionEventType.ASSISTANT_INTENT.value:
         intent = getattr(data, "intent", None) or ""
@@ -303,7 +361,7 @@ def _format_event(event: SessionEvent, event_type: str) -> Optional[str]:
 
     elif event_type == SessionEventType.SESSION_TASK_COMPLETE.value:
         summary = getattr(data, "summary", None) or ""
-        return f"🏁 <b>Task complete</b>\n{escape(truncate(summary, 1000))}"
+        return f"🏁 <b>Task complete</b>\n{md_to_telegram_html(truncate(summary, 1000))}"
 
     elif event_type == SessionEventType.ASSISTANT_TURN_START.value:
         return "⚡ <i>Agent working...</i>"
