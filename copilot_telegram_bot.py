@@ -761,10 +761,13 @@ def _repair_session_file(session_id: str) -> bool:
 
         orphaned = requested_ids - completed_ids
         if orphaned:
+            import uuid as _uuid
+
             extra_lines = []
             for tid in orphaned:
                 synthetic = json.dumps({
                     "type": "tool.execution_complete",
+                    "id": str(_uuid.uuid4()),
                     "data": {
                         "toolCallId": tid,
                         "model": "unknown",
