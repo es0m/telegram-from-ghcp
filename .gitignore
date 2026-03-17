@@ -8,4 +8,6 @@ __pycache__/
 
 # Headless server temp files
 headless_*.txt
-bot_debug.log
+
+# Logs
+*.log
