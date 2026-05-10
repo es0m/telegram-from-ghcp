@@ -4,7 +4,8 @@
 # dependencies = [
 #     "github-copilot-sdk>=0.1.0",
 #     "python-telegram-bot>=22.0",
-#     "faster-whisper>=1.1.0",
+#     # faster-whisper is optional — auto-enabled on x64, off on arm64
+#     # Install manually: pip install faster-whisper>=1.1.0
 # ]
 # ///
 """
@@ -97,6 +98,23 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("copilot-telegram")
+
+# ── Voice support detection ────────────────────────────────────────────────
+# On ARM64, voice (faster-whisper) is off by default because ctranslate2
+# wheels are generally unavailable.  On x86_64 it is on by default.
+# Override with VOICE_ENABLED=1 / VOICE_ENABLED=0 or config key "voice_enabled".
+_machine = platform.machine().lower()
+_is_arm64 = _machine in ("aarch64", "arm64")
+_voice_default = not _is_arm64  # True on x64, False on arm64
+
+VOICE_ENABLED: bool = _voice_default  # will be finalised in main()
+
+_faster_whisper_available: bool = False
+try:
+    import faster_whisper as _fw  # noqa: F401
+    _faster_whisper_available = True
+except ImportError:
+    pass
 
 
 # ── Session Classification ───────────────────────────────────────────────────
@@ -1527,6 +1545,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
+    if not VOICE_ENABLED:
+        await update.message.reply_text(
+            "🎙️ Voice support is disabled on this device.\n"
+            "Set voice_enabled=true in config or VOICE_ENABLED=1 env var.",
+        )
+        return
+
     if state.current_session is None:
         await update.message.reply_text(
             "No active session. Use /switch to connect first.",
@@ -1661,6 +1686,8 @@ def load_config() -> dict[str, Any]:
         config["allowed_usernames"] = [x.strip().lstrip("@") for x in env_users.split(",") if x.strip()]
     if env_device := os.environ.get("DEVICE_NAME"):
         config["device_name"] = env_device
+    if env_voice := os.environ.get("VOICE_ENABLED"):
+        config["voice_enabled"] = env_voice.strip().lower() in ("1", "true", "yes")
 
     return config
 
@@ -1680,6 +1707,19 @@ def main():
     state.device_name = get_device_name(config)
     state.session_display_names = _load_display_names()
     logger.info(f"Device name: {state.device_name}")
+
+    # Resolve voice support
+    global VOICE_ENABLED
+    if "voice_enabled" in config:
+        VOICE_ENABLED = bool(config["voice_enabled"])
+    # even if enabled by config/default, we need the library
+    if VOICE_ENABLED and not _faster_whisper_available:
+        logger.warning(
+            "Voice support requested but faster-whisper is not installed — disabling. "
+            "Install with: pip install faster-whisper>=1.1.0"
+        )
+        VOICE_ENABLED = False
+    logger.info(f"Voice support: {'enabled' if VOICE_ENABLED else 'disabled'} (arch={_machine})")
 
     # Parse allowed chat IDs
     allowed = config.get("allowed_usernames", [])
