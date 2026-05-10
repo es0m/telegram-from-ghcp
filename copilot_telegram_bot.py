@@ -28,6 +28,7 @@ Commands:
   /devices       — Show this bot's device info
   /name <name>   — Set a display name for the current session
   /activate [dev]— Switch which device is actively polling
+  /yield         — Active bot steps back, any standby device claims
   /help          — Show available commands
 
   Photos sent to the chat are forwarded to the session as image attachments.
@@ -691,6 +692,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/name &lt;name&gt; — Set display name for current session\n"
         "/devices — Show this bot's device info\n"
         "/activate [dev] — Switch active polling device\n"
+        "/yield — Active bot steps back, any standby claims\n"
         "/disconnect — Disconnect from session\n"
         "/help — Show this help",
         parse_mode=ParseMode.HTML,
@@ -1916,6 +1918,37 @@ async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.app.stop_running()
 
 
+async def cmd_yield(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /yield — active bot steps back, any standby can claim.
+
+    Sets pinned target to '*' (first-come-first-served) and enters standby.
+    """
+    if not is_authorized(update):
+        return
+
+    if not state.is_active:
+        await update.message.reply_text(
+            f"🟡 <b>{escape(state.device_name)}</b> is already in standby.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    sessions = await _get_session_count()
+    await _update_coordination_pin(context.bot, state.device_name, "*", sessions)
+
+    await update.message.reply_text(
+        f"🔄 <b>{escape(state.device_name)}</b> yielding...\n"
+        f"<i>Next standby device to check in will take over.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    state._coordination_chat_id = update.effective_chat.id
+    await _announce_offline(context.bot, update.effective_chat.id)
+
+    state.is_active = False
+    state.app.stop_running()
+
+
 # ── Application Lifecycle ───────────────────────────────────────────────────
 
 async def _active_post_init(application: Application):
@@ -2205,6 +2238,7 @@ def _run_active(token: str, config: dict):
     app.add_handler(CommandHandler("devices", cmd_devices))
     app.add_handler(CommandHandler("name", cmd_name))
     app.add_handler(CommandHandler("activate", cmd_activate))
+    app.add_handler(CommandHandler("yield", cmd_yield))
 
     # Handle inline keyboard button presses
     app.add_handler(CallbackQueryHandler(callback_switch, pattern=r"^switch:"))
