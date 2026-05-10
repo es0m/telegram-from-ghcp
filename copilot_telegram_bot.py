@@ -27,6 +27,7 @@ Commands:
   /disconnect    — Disconnect from current session
   /devices       — Show this bot's device info
   /name <name>   — Set a display name for the current session
+  /activate [dev]— Switch which device is actively polling
   /help          — Show available commands
 
   Photos sent to the chat are forwarded to the session as image attachments.
@@ -82,6 +83,7 @@ from copilot.generated.session_events import (
     SessionEvent,
     SessionEventType,
 )
+import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -327,6 +329,12 @@ class BotState:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Background session watchers: session_id → WatchedSession
         self.watched_sessions: dict[str, "WatchedSession"] = {}
+        # Multi-device coordination
+        self.is_active: bool = False  # True if this instance is the active poller
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._standby_task: Optional[asyncio.Task] = None
+        self._coordination_chat_id: Optional[int] = None  # chat ID for pinned message
+        self._pinned_message_id: Optional[int] = None  # message ID of our coordination pin
 
 
 class WatchedSession:
@@ -671,10 +679,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/send &lt;message&gt; — Send a prompt\n"
         "/name &lt;name&gt; — Set display name for current session\n"
         "/devices — Show this bot's device info\n"
+        "/activate [dev] — Switch active polling device\n"
         "/disconnect — Disconnect from session\n"
         "/help — Show this help",
         parse_mode=ParseMode.HTML,
     )
+
+    # Set coordination chat ID for multi-device coordination
+    if state._coordination_chat_id is None:
+        state._coordination_chat_id = update.effective_chat.id
+        _save_coordination_state()
+        logger.info(f"Coordination chat set to {state._coordination_chat_id}")
+
+    # Announce online and update coordination pin
+    if state.is_active and state._coordination_chat_id:
+        sessions = await _get_session_count()
+        await _update_coordination_pin(
+            context.bot, state.device_name, state.device_name, sessions
+        )
+        await _announce_online(context.bot, state._coordination_chat_id)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1316,6 +1339,12 @@ async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sid_short = state.current_session_id[:8]
         lines.append(f"<b>Connected:</b> <code>{sid_short}</code>")
 
+    # Show coordination status
+    if state.is_active:
+        lines.append(f"<b>Mode:</b> 🟢 ACTIVE (polling)")
+    else:
+        lines.append(f"<b>Mode:</b> 🟡 STANDBY")
+
     lines.append(
         f"\n<i>💡 Multiple bots can post to this channel. "
         f"Each bot prefixes sessions with its device name "
@@ -1611,18 +1640,263 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ── Multi-Device Coordination ──────────────────────────────────────────────
+
+HEARTBEAT_INTERVAL = 120  # seconds between heartbeat updates
+STANDBY_CHECK_INTERVAL = 30  # seconds between standby checks
+HEARTBEAT_STALE_THRESHOLD = 300  # 5 minutes — if heartbeat older, assume crashed
+
+COORD_PREFIX = "🤖 "  # prefix for coordination messages to identify them
+
+COORD_STATE_FILE = Path.home() / ".copilot" / "copilot_coordination.json"
+
+
+def _parse_coord_message(text: str) -> Optional[dict]:
+    """Parse a coordination pinned message. Returns dict or None."""
+    if not text or not text.startswith(COORD_PREFIX):
+        return None
+    try:
+        return json.loads(text[len(COORD_PREFIX):])
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _build_coord_message(active: str, target: str, sessions: int = 0) -> str:
+    """Build a coordination message string."""
+    data = {
+        "active": active,
+        "target": target,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "sessions": sessions,
+    }
+    return COORD_PREFIX + json.dumps(data)
+
+
+async def _get_session_count() -> int:
+    """Get count of active sessions on this device."""
+    try:
+        client = await ensure_client()
+        sessions = await client.list_sessions()
+        now = datetime.now(timezone.utc)
+        return sum(1 for s in sessions if classify_session(s, now) in ("active", "recent"))
+    except Exception:
+        return 0
+
+
+async def _read_pinned_coordination(bot) -> Optional[dict]:
+    """Read the coordination data from the pinned message in the chat."""
+    if not state._coordination_chat_id:
+        return None
+    try:
+        chat = await bot.get_chat(state._coordination_chat_id)
+        if chat.pinned_message and chat.pinned_message.text:
+            return _parse_coord_message(chat.pinned_message.text)
+    except Exception as e:
+        logger.debug(f"Could not read pinned message: {e}")
+    return None
+
+
+async def _update_coordination_pin(bot, active: str, target: str, sessions: int = 0):
+    """Update (or create) the pinned coordination message."""
+    text = _build_coord_message(active, target, sessions)
+    try:
+        if state._pinned_message_id:
+            # Edit existing message
+            await bot.edit_message_text(
+                text=text,
+                chat_id=state._coordination_chat_id,
+                message_id=state._pinned_message_id,
+            )
+        else:
+            # Send new message and pin it
+            msg = await bot.send_message(
+                chat_id=state._coordination_chat_id,
+                text=text,
+            )
+            state._pinned_message_id = msg.message_id
+            _save_coordination_state()
+            try:
+                await bot.pin_chat_message(
+                    chat_id=state._coordination_chat_id,
+                    message_id=msg.message_id,
+                    disable_notification=True,
+                )
+            except Exception as e:
+                logger.warning(f"Could not pin coordination message: {e}")
+    except Exception as e:
+        logger.error(f"Failed to update coordination pin: {e}")
+
+
+async def _heartbeat_loop():
+    """Periodically update the pinned message heartbeat while active."""
+    while state.is_active:
+        try:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            if not state.is_active or not state.app:
+                break
+            sessions = await _get_session_count()
+            await _update_coordination_pin(
+                state.app.bot, state.device_name, state.device_name, sessions
+            )
+            logger.debug("Heartbeat updated")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"Heartbeat error: {e}")
+
+
+async def _announce_online(bot, chat_id: int):
+    """Post an online announcement with session summary."""
+    sessions = await _get_session_count()
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"🟢 <b>[{escape(state.device_name)}]</b> online — {sessions} session(s)",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _announce_offline(bot, chat_id: int):
+    """Post an offline announcement."""
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"🔴 <b>[{escape(state.device_name)}]</b> offline — entering standby",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def _save_coordination_state():
+    """Persist coordination chat ID for standby instances."""
+    try:
+        data = {}
+        if COORD_STATE_FILE.exists():
+            data = json.loads(COORD_STATE_FILE.read_text(encoding="utf-8"))
+        data["chat_id"] = state._coordination_chat_id
+        if state._pinned_message_id:
+            data["pinned_message_id"] = state._pinned_message_id
+        COORD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        COORD_STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.debug(f"Could not save coordination state: {e}")
+
+
+def _load_coordination_state():
+    """Load coordination state from disk."""
+    try:
+        if COORD_STATE_FILE.exists():
+            data = json.loads(COORD_STATE_FILE.read_text(encoding="utf-8"))
+            state._coordination_chat_id = data.get("chat_id")
+            state._pinned_message_id = data.get("pinned_message_id")
+            logger.info(f"Loaded coordination state: chat={state._coordination_chat_id}")
+    except Exception as e:
+        logger.debug(f"Could not load coordination state: {e}")
+
+
+async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /activate [device] — switch which device is actively polling.
+
+    /activate            — show current active device
+    /activate <name>     — hand off to named device
+    /activate *          — hand off to any standby device (first-come-first-served)
+    """
+    if not is_authorized(update):
+        return
+
+    args = (context.args[0] if context.args else "").strip()
+
+    if not args:
+        # Show current status
+        coord = await _read_pinned_coordination(context.bot)
+        if coord:
+            active = coord.get("active", "?")
+            target = coord.get("target", "?")
+            ts_str = coord.get("ts", "")
+            sessions = coord.get("sessions", 0)
+            age_str = ""
+            if ts_str:
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    age = (datetime.now(timezone.utc) - ts).total_seconds()
+                    age_str = f" ({int(age)}s ago)"
+                except Exception:
+                    pass
+
+            lines = [
+                f"📟 <b>Device Coordination</b>\n",
+                f"<b>Active:</b> {escape(active)}{age_str}",
+                f"<b>Target:</b> {escape(target)}",
+                f"<b>Sessions:</b> {sessions}",
+                f"<b>This device:</b> {escape(state.device_name)}",
+                f"<b>Status:</b> {'🟢 ACTIVE' if state.is_active else '🟡 STANDBY'}",
+                f"\n💡 <code>/activate &lt;device&gt;</code> to switch",
+                f"💡 <code>/activate *</code> for first-come-first-served",
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(
+                f"📟 No coordination data.\n"
+                f"This device: <b>{escape(state.device_name)}</b> ({'🟢 ACTIVE' if state.is_active else '🟡 STANDBY'})",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    target_device = args
+
+    if target_device.lower() == state.device_name.lower():
+        await update.message.reply_text(
+            f"✅ <b>{escape(state.device_name)}</b> is already the active device.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Hand off to target device
+    sessions = await _get_session_count()
+    await _update_coordination_pin(context.bot, state.device_name, target_device, sessions)
+
+    await update.message.reply_text(
+        f"🔄 Handing off to <b>{escape(target_device)}</b>...\n"
+        f"<i>{escape(state.device_name)} will enter standby. "
+        f"Target device should come online within ~{STANDBY_CHECK_INTERVAL}s.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Post offline announcement
+    state._coordination_chat_id = update.effective_chat.id
+    await _announce_offline(context.bot, update.effective_chat.id)
+
+    # Stop polling — this will cause the application to shut down,
+    # and main() will restart in standby mode
+    state.is_active = False
+
+    # Signal the application to stop
+    state.app.stop_running()
+
+
 # ── Application Lifecycle ───────────────────────────────────────────────────
 
-async def post_init(application: Application):
-    """Called after the application is initialized."""
+async def _active_post_init(application: Application):
+    """Called after the application is initialized in active mode."""
     state.app = application
     state._loop = asyncio.get_event_loop()
-    logger.info("Telegram bot initialized")
+    state.is_active = True
+    logger.info("Telegram bot initialized (ACTIVE)")
+
+    # Start heartbeat task
+    state._heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
 
-async def post_shutdown(application: Application):
-    """Called during application shutdown."""
-    logger.info("Shutting down...")
+async def _active_post_shutdown(application: Application):
+    """Called during active mode shutdown."""
+    logger.info("Shutting down active mode...")
+
+    # Cancel heartbeat
+    if state._heartbeat_task:
+        state._heartbeat_task.cancel()
+        try:
+            await state._heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        state._heartbeat_task = None
+
     # Unsubscribe all background watchers
     for watched in state.watched_sessions.values():
         try:
@@ -1638,7 +1912,9 @@ async def post_shutdown(application: Application):
         except Exception:
             pass
         state.client = None
-    logger.info("Shutdown complete")
+
+    state.is_active = False
+    logger.info("Active mode shutdown complete")
 
 
 DEFAULT_CONFIG_PATH = "copilot_bot_config.json"
@@ -1712,7 +1988,6 @@ def main():
     global VOICE_ENABLED
     if "voice_enabled" in config:
         VOICE_ENABLED = bool(config["voice_enabled"])
-    # even if enabled by config/default, we need the library
     if VOICE_ENABLED and not _faster_whisper_available:
         logger.warning(
             "Voice support requested but faster-whisper is not installed — disabling. "
@@ -1721,14 +1996,103 @@ def main():
         VOICE_ENABLED = False
     logger.info(f"Voice support: {'enabled' if VOICE_ENABLED else 'disabled'} (arch={_machine})")
 
-    # Parse allowed chat IDs
+    # Parse allowed usernames
     allowed = config.get("allowed_usernames", [])
     if allowed:
         state.allowed_usernames = {u.lower().lstrip("@") for u in allowed}
         logger.info(f"Access restricted to usernames: {state.allowed_usernames}")
 
+    # Load coordination state from disk (chat ID, pinned message ID)
+    _load_coordination_state()
+
+    # Get coordination chat ID from config (optional — overrides saved state)
+    if config.get("coordination_chat_id"):
+        state._coordination_chat_id = config["coordination_chat_id"]
+
+    # Main active/standby loop
+    while True:
+        # Check if we should start as active or standby
+        should_be_active = asyncio.run(_check_should_activate(token))
+
+        if should_be_active:
+            state.is_active = True
+            logger.info("Starting in ACTIVE mode")
+            _run_active(token, config)
+            # If we get here, polling stopped (handoff or error)
+            logger.info("Active polling ended")
+            state.is_active = False
+        else:
+            logger.info("Starting in STANDBY mode")
+            # Run standby loop — blocks until we should activate
+            try:
+                asyncio.run(_run_standby(token))
+            except KeyboardInterrupt:
+                logger.info("Standby interrupted")
+                break
+
+
+async def _check_should_activate(token: str) -> bool:
+    """Check pinned message to determine if this device should be active."""
+    from telegram import Bot
+    bot = Bot(token)
+
+    if not state._coordination_chat_id:
+        # No chat ID yet — start active (first run)
+        return True
+
+    try:
+        coord = await _read_pinned_coordination(bot)
+        if coord is None:
+            return True  # No coordination — claim active
+
+        target = coord.get("target", "")
+        ts_str = coord.get("ts", "")
+
+        # We're the target
+        if target.lower() == state.device_name.lower():
+            return True
+
+        # Wildcard
+        if target == "*":
+            return True
+
+        # Stale heartbeat (crashed active)
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - ts).total_seconds()
+                if age > HEARTBEAT_STALE_THRESHOLD:
+                    logger.info(f"Stale heartbeat ({age:.0f}s) — claiming active")
+                    return True
+            except Exception:
+                pass
+
+        return False
+    except Exception as e:
+        logger.warning(f"Could not check coordination: {e}")
+        return True  # If we can't check, try active
+
+
+async def _run_standby(token: str):
+    """Run in standby mode, checking pinned message until activation."""
+    from telegram import Bot
+    bot = Bot(token)
+
+    logger.info(f"Standby mode — checking every {STANDBY_CHECK_INTERVAL}s for activation")
+
+    while True:
+        await asyncio.sleep(STANDBY_CHECK_INTERVAL)
+
+        should = await _check_should_activate(token)
+        if should:
+            logger.info("Activation condition met — switching to active")
+            return  # Return to main loop which will start active
+
+
+def _run_active(token: str, config: dict):
+    """Run in active mode with full Telegram polling."""
     # Build Telegram application
-    app = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = Application.builder().token(token).post_init(_active_post_init).post_shutdown(_active_post_shutdown).build()
 
     # Register command handlers
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1743,20 +2107,21 @@ def main():
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
     app.add_handler(CommandHandler("devices", cmd_devices))
     app.add_handler(CommandHandler("name", cmd_name))
+    app.add_handler(CommandHandler("activate", cmd_activate))
 
-    # Handle inline keyboard button presses (e.g., session switch from /list)
+    # Handle inline keyboard button presses
     app.add_handler(CallbackQueryHandler(callback_switch, pattern=r"^switch:"))
 
-    # Handle plain text messages as prompts when connected
+    # Handle plain text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Handle photo messages as image attachments
+    # Handle photo messages
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Handle voice messages — transcribe and send as text
+    # Handle voice messages
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
-    logger.info("Starting Copilot Sessions Telegram Bot...")
+    logger.info("Starting Copilot Sessions Telegram Bot (ACTIVE)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
