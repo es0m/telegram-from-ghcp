@@ -71,13 +71,13 @@ from typing import Any, Optional
 from copilot import (
     CopilotClient,
     CopilotSession,
-    MessageOptions,
-    PermissionHandler,
-    ResumeSessionConfig,
+    SubprocessConfig,
+)
+from copilot.session import PermissionHandler
+from copilot.client import (
     SessionListFilter,
     SessionMetadata,
 )
-from copilot.types import CopilotClientOptions
 from copilot.generated.session_events import (
     SessionEvent,
     SessionEventType,
@@ -421,7 +421,7 @@ async def ensure_client() -> CopilotClient:
         if resolved:
             cli_path = resolved
 
-        options = CopilotClientOptions(
+        options = SubprocessConfig(
             cli_path=cli_path,
             log_level=log_level,
             cli_args=["--allow-all"],
@@ -548,10 +548,10 @@ async def watch_active_sessions():
             # Resume and subscribe
             try:
                 _repair_session_file(sid)
-                config = ResumeSessionConfig(
+                session = await client.resume_session(
+                    sid,
                     on_permission_request=PermissionHandler.approve_all,
                 )
-                session = await client.resume_session(sid, config)
                 handler = _make_background_handler(sid)
                 unsub = session.on(handler)
                 watched = WatchedSession(
@@ -1084,10 +1084,10 @@ async def _do_resume(session_id: str, chat_id: int) -> tuple:
         # Pre-repair: fix known corruption before attempting resume
         _repair_session_file(session_id)
 
-        config = ResumeSessionConfig(
+        session = await client.resume_session(
+            session_id,
             on_permission_request=PermissionHandler.approve_all,
         )
-        session = await client.resume_session(session_id, config)
 
         state.current_session = session
         state.current_session_id = session_id
@@ -1276,7 +1276,7 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📤 Sending to session...",
         )
-        message_id = await state.current_session.send(MessageOptions(prompt=prompt))
+        message_id = await state.current_session.send(prompt)
         logger.info(f"Sent message {message_id} to session {state.current_session_id[:8]}")
     except Exception as e:
         logger.error(f"Error sending message: {e}")
@@ -1495,7 +1495,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        message_id = await state.current_session.send(MessageOptions(prompt=prompt))
+        message_id = await state.current_session.send(prompt)
         logger.info(f"Sent message {message_id} to session {state.current_session_id[:8]}")
         await update.message.reply_text("📤 Sent")
     except Exception as e:
@@ -1536,7 +1536,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         attachment = {"type": "file", "path": tmp_path, "displayName": os.path.basename(tmp_path)}
         message_id = await state.current_session.send(
-            MessageOptions(prompt=caption, attachments=[attachment])
+            caption, attachments=[attachment]
         )
         logger.info(f"Sent photo + prompt to session {state.current_session_id[:8]}")
         await update.message.reply_text(f"📤 Sent photo with: {escape(caption)}", parse_mode=ParseMode.HTML)
@@ -1628,7 +1628,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
-        message_id = await state.current_session.send(MessageOptions(prompt=text))
+        message_id = await state.current_session.send(text)
         logger.info(f"Sent voice transcription ({len(text)} chars) as message {message_id}")
 
     except Exception as e:

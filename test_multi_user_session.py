@@ -192,8 +192,8 @@ class TestDeviceRegistry:
 copilot_available = shutil.which("copilot") is not None
 
 try:
-    from copilot import CopilotClient, PermissionHandler, ResumeSessionConfig
-    from copilot.types import CopilotClientOptions
+    from copilot import CopilotClient, SubprocessConfig
+    from copilot.session import PermissionHandler
     from copilot.generated.session_events import SessionEventType
     sdk_available = True
 except ImportError:
@@ -215,7 +215,7 @@ class TestMultiUserSession:
     async def _make_client(self) -> CopilotClient:
         """Create and start a CopilotClient."""
         cli_path = shutil.which("copilot") or "copilot"
-        options = CopilotClientOptions(
+        options = SubprocessConfig(
             cli_path=cli_path,
             log_level="none",
             cli_args=["--allow-all"],
@@ -260,16 +260,16 @@ class TestMultiUserSession:
             sid = target.sessionId
 
             # Client A resumes the session
-            config_a = ResumeSessionConfig(
+            session_a = await client_a.resume_session(
+                sid,
                 on_permission_request=PermissionHandler.approve_all,
             )
-            session_a = await client_a.resume_session(sid, config_a)
 
             # Client B resumes the same session
-            config_b = ResumeSessionConfig(
+            session_b = await client_b.resume_session(
+                sid,
                 on_permission_request=PermissionHandler.approve_all,
             )
-            session_b = await client_b.resume_session(sid, config_b)
 
             # Collect events from both
             events_a: list = []
