@@ -1058,8 +1058,14 @@ def _repair_session_file(session_id: str) -> bool:
         return False
 
 
-async def _do_resume(session_id: str, chat_id: int) -> tuple:
+async def _do_resume(session_id: str, chat_id: int, pre_meta=None) -> tuple:
     """Shared logic for resuming a session (used by both /switch and button callback).
+
+    Args:
+        session_id: The session to resume.
+        chat_id: Telegram chat ID for event forwarding.
+        pre_meta: SessionMetadata fetched *before* resume (preferred, since
+                  resume_session may alter the SDK's context/cwd).
 
     Returns (session, meta) on success.
     Raises on failure.
@@ -1091,14 +1097,16 @@ async def _do_resume(session_id: str, chat_id: int) -> tuple:
             except Exception:
                 pass
 
-        # Fetch metadata (non-critical)
-        meta = None
-        try:
-            sessions = await client.list_sessions()
-            meta = next((s for s in sessions if s.sessionId == session_id), None)
-            state.current_session_meta = meta
-        except Exception:
-            pass
+        # Use pre-resume metadata if available (resume may overwrite cwd).
+        # Only fall back to a fresh list_sessions if we have nothing.
+        meta = pre_meta
+        if meta is None:
+            try:
+                sessions = await client.list_sessions()
+                meta = next((s for s in sessions if s.sessionId == session_id), None)
+            except Exception:
+                pass
+        state.current_session_meta = meta
 
         _chdir_to_session(meta)
         return session, meta
@@ -1150,7 +1158,7 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
-        _, meta = await _do_resume(match.sessionId, update.effective_chat.id)
+        _, meta = await _do_resume(match.sessionId, update.effective_chat.id, pre_meta=match)
         meta = meta or match
 
         summary = escape((meta.summary if meta else None) or "—")
@@ -1459,8 +1467,18 @@ async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             session_id = matches[0].sessionId
+            pre_meta = matches[0]
+        else:
+            # Full session ID — fetch metadata before resume
+            pre_meta = None
+            try:
+                client = await ensure_client()
+                sessions = await client.list_sessions()
+                pre_meta = next((s for s in sessions if s.sessionId == session_id), None)
+            except Exception:
+                pass
 
-        _, meta = await _do_resume(session_id, query.message.chat_id)
+        _, meta = await _do_resume(session_id, query.message.chat_id, pre_meta=pre_meta)
 
         summary = escape((meta.summary if meta else None) or "—")
         cwd = ""
