@@ -2144,24 +2144,45 @@ def _run_active(token: str, config: dict):
     """Run in active mode with full Telegram polling.
 
     If another instance is already polling (Conflict error), an error
-    handler catches it and stops the application, falling through to standby.
+    handler catches it. If this device is the designated active device
+    (per pinned message), it retries instead of stepping back.
     """
     from telegram.error import Conflict, NetworkError
 
+    _conflict_count = 0  # track consecutive conflicts for backoff
+
     async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-        """Application error handler — catch Conflict and stop polling."""
+        """Application error handler — catch Conflict and decide whether to yield."""
+        nonlocal _conflict_count
         error = context.error
         if isinstance(error, Conflict) or (
             isinstance(error, NetworkError) and "conflict" in str(error).lower()
         ):
+            _conflict_count += 1
+
+            # Check pinned message: are we the designated device?
+            coord = await _read_pinned_coordination(context.bot)
+            if coord:
+                target = coord.get("target", "")
+                if target.lower() == state.device_name.lower():
+                    logger.warning(
+                        f"Conflict but we are the designated device — "
+                        f"retrying (attempt {_conflict_count})"
+                    )
+                    # Don't step back; the polling loop will retry automatically
+                    return
+
+            # We're not the designated device (or no coordination) — yield
             logger.warning(
-                "Conflict: another bot instance is already polling — entering standby"
+                "Conflict: another instance is polling and we are not the "
+                "designated device — entering standby"
             )
             state.is_active = False
             if state.app:
                 state.app.stop_running()
             return
         # Log other errors normally
+        _conflict_count = 0
         logger.error(f"Unhandled error: {error}", exc_info=context.error)
 
     # Build Telegram application
