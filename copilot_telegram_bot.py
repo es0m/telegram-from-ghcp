@@ -2090,7 +2090,13 @@ async def _run_standby(token: str):
 
 
 def _run_active(token: str, config: dict):
-    """Run in active mode with full Telegram polling."""
+    """Run in active mode with full Telegram polling.
+
+    If another instance is already polling (Conflict error), catches the
+    exception and returns so the main loop can fall through to standby.
+    """
+    from telegram.error import Conflict, NetworkError
+
     # Build Telegram application
     app = Application.builder().token(token).post_init(_active_post_init).post_shutdown(_active_post_shutdown).build()
 
@@ -2122,7 +2128,21 @@ def _run_active(token: str, config: dict):
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
     logger.info("Starting Copilot Sessions Telegram Bot (ACTIVE)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Conflict:
+        logger.warning(
+            "Conflict: another bot instance is already polling — entering standby"
+        )
+        state.is_active = False
+    except NetworkError as e:
+        if "conflict" in str(e).lower():
+            logger.warning(
+                "Conflict (NetworkError): another instance polling — entering standby"
+            )
+            state.is_active = False
+        else:
+            raise
 
 
 if __name__ == "__main__":
