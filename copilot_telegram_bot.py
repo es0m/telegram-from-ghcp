@@ -16,12 +16,16 @@ session events to a Telegram chat in real time.
 
 Commands:
   /start         — Welcome message and usage help
-  /list          — List all sessions (active ones highlighted)
+  /list          — List recent sessions grouped by active/recent/stale
+  /all           — List all sessions including old (>1 month) ones
+  /stale         — Show only stale and old sessions
   /active [days] — Show sessions active in the last N days (default: 7)
   /switch <id>   — Connect to a session and subscribe to its events
   /status        — Show current session info
   /send <msg>    — Send a prompt to the current session
   /disconnect    — Disconnect from current session
+  /devices       — Show known devices and their sessions
+  /name <name>   — Set a display name for the current session
   /help          — Show available commands
 
   Photos sent to the chat are forwarded to the session as image attachments.
@@ -34,6 +38,7 @@ Environment:
   COPILOT_CLI_PATH     — Optional. Path to copilot binary (default: "copilot")
   COPILOT_LOG_LEVEL    — Optional. CLI log level (default: "none")
   ALLOWED_USERNAMES    — Optional. Comma-separated Telegram usernames allowed to use the bot
+  DEVICE_NAME          — Optional. A name for this device (default: hostname)
 
 Config file (JSON):
   Reads from ./copilot_bot_config.json or path set in COPILOT_BOT_CONFIG env var.
@@ -43,7 +48,8 @@ Config file (JSON):
       "telegram_bot_token": "123456:ABC...",
       "allowed_usernames": ["your_telegram_username"],
       "copilot_cli_path": "copilot",
-      "copilot_log_level": "none"
+      "copilot_log_level": "none",
+      "device_name": "work-laptop"
     }
 """
 
@@ -52,7 +58,9 @@ import html
 import json
 import logging
 import os
+import platform
 import shutil
+import socket as _socket
 import sys
 import tempfile
 import traceback
@@ -90,6 +98,143 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("copilot-telegram")
+
+
+# ── Session Classification ───────────────────────────────────────────────────
+
+STALE_THRESHOLD_DAYS = 30  # Sessions older than this are "stale"
+
+
+def classify_session(meta, now: datetime = None) -> str:
+    """Classify a session as 'active', 'recent', or 'stale'.
+
+    - active: modified in the last 24 hours
+    - recent: modified within the last STALE_THRESHOLD_DAYS days
+    - stale:  older than STALE_THRESHOLD_DAYS days
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    mod_time = meta.modifiedTime
+    if not mod_time:
+        return "stale"
+    try:
+        mod = datetime.fromisoformat(mod_time.replace("Z", "+00:00"))
+        age = now - mod
+        if age < timedelta(days=1):
+            return "active"
+        elif age < timedelta(days=STALE_THRESHOLD_DAYS):
+            return "recent"
+        else:
+            return "stale"
+    except Exception:
+        return "stale"
+
+
+def get_session_display_name(meta, device_name: str = "") -> str:
+    """Build a meaningful display name for a session.
+
+    Priority:
+      1. Session summary (from SDK, typically set by the agent)
+      2. Repository name (owner/repo → repo)
+      3. Last directory component of cwd
+      4. Session ID prefix
+    """
+    name = ""
+
+    # 1. Summary
+    if meta.summary:
+        name = meta.summary.strip()
+        # Truncate overly long summaries
+        if len(name) > 60:
+            name = name[:57] + "…"
+
+    # 2. Repository
+    if not name and meta.context and meta.context.repository:
+        repo = meta.context.repository
+        # "owner/repo" → "repo"
+        if "/" in repo:
+            repo = repo.split("/")[-1]
+        name = repo
+
+    # 3. CWD basename
+    if not name and meta.context and meta.context.cwd:
+        cwd = meta.context.cwd
+        basename = Path(cwd).name
+        if basename:
+            name = basename
+
+    # 4. Fallback to session ID prefix
+    if not name:
+        name = meta.sessionId[:8]
+
+    # Prefix with device name if available
+    if device_name:
+        return f"[{device_name}] {name}"
+    return name
+
+
+def get_device_name(config: dict) -> str:
+    """Get the device name from config, env, or fallback to hostname."""
+    name = config.get("device_name") or os.environ.get("DEVICE_NAME") or ""
+    if not name:
+        try:
+            name = platform.node()  # hostname
+        except Exception:
+            name = "unknown"
+    return name
+
+
+# ── Device Registry ──────────────────────────────────────────────────────────
+
+DEVICE_REGISTRY_FILENAME = "device_registry.json"
+
+
+def _get_registry_path() -> Path:
+    """Path to the shared device registry under ~/.copilot/."""
+    return Path.home() / ".copilot" / DEVICE_REGISTRY_FILENAME
+
+
+def load_device_registry() -> dict:
+    """Load the device registry. Returns {device_name: {sessions: [...], ...}}."""
+    path = _get_registry_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_device_registry(registry: dict) -> None:
+    """Persist the device registry."""
+    path = _get_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(registry, indent=2), encoding="utf-8")
+
+
+def update_device_entry(device_name: str, sessions: list) -> None:
+    """Update this device's entry in the shared registry.
+
+    Each entry stores the device name, last seen timestamp, hostname,
+    and a list of session summaries.
+    """
+    registry = load_device_registry()
+    registry[device_name] = {
+        "hostname": platform.node(),
+        "last_seen": datetime.now(timezone.utc).isoformat(),
+        "sessions": [
+            {
+                "sessionId": s.sessionId,
+                "summary": s.summary,
+                "modifiedTime": s.modifiedTime,
+                "cwd": s.context.cwd if s.context else None,
+                "repository": s.context.repository if s.context else None,
+            }
+            for s in sessions[:50]  # cap to prevent unbounded growth
+        ],
+    }
+    save_device_registry(registry)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -198,6 +343,18 @@ class BotState:
         # Track last event type to avoid spamming identical statuses
         self._last_event_type: Optional[str] = None
         # Buffer for streaming deltas
+        self._delta_buffer: str = ""
+        self._delta_message_id: Optional[int] = None
+        # Lock for async operations
+        self._lock = asyncio.Lock()
+        # Event loop reference for thread-safe callbacks
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Background session watchers: session_id → WatchedSession
+        self.watched_sessions: dict[str, "WatchedSession"] = {}
+        # Device name for this instance
+        self.device_name: str = ""
+        # User-assigned display names: session_id → name
+        self.session_display_names: dict[str, str] = {}
         self._delta_buffer: str = ""
         self._delta_message_id: Optional[int] = None
         # Lock for async operations
@@ -539,12 +696,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>Copilot Sessions Bot</b>\n\n"
         "I connect to your local Copilot CLI sessions and let you "
         "monitor and interact with them via Telegram.\n\n"
+        f"📟 Device: <b>{escape(state.device_name)}</b>\n\n"
         "<b>Commands:</b>\n"
-        "/list — List all sessions\n"
-        "/active [days] — Recent sessions (default: 7 days)\n"
+        "/list — Active &amp; recent sessions (hides stale &gt;1mo)\n"
+        "/all — All sessions including old ones\n"
+        "/stale — Only stale/old sessions\n"
+        "/active [days] — Sessions active in last N days\n"
         "/switch &lt;id&gt; — Connect to a session\n"
         "/status — Current session info\n"
         "/send &lt;message&gt; — Send a prompt\n"
+        "/name &lt;name&gt; — Set display name for current session\n"
+        "/devices — Show all known devices\n"
         "/disconnect — Disconnect from session\n"
         "/help — Show this help",
         parse_mode=ParseMode.HTML,
@@ -556,11 +718,36 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
 
 
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /list command — list all sessions."""
-    if not is_authorized(update):
-        return
+def _format_session_line(s, device_name: str, is_current: bool = False) -> str:
+    """Format a single session as a Telegram HTML line."""
+    sid_short = s.sessionId[:8]
+    display = get_session_display_name(s, device_name="")
+    # Check for user-assigned name override
+    if s.sessionId in state.session_display_names:
+        display = state.session_display_names[s.sessionId]
+    age = format_time_ago(s.modifiedTime)
 
+    cwd_line = ""
+    if s.context and s.context.cwd:
+        cwd_line = f"\n    📁 <code>{escape(s.context.cwd)}</code>"
+
+    branch_tag = ""
+    if s.context and s.context.branch:
+        branch_tag = f" 🌿{escape(s.context.branch)}"
+
+    marker = "▶️" if is_current else "  "
+    return (
+        f"{marker}<code>{sid_short}</code> {escape(display)}"
+        f"\n    <i>{age}{branch_tag}</i>{cwd_line}"
+    )
+
+
+async def _list_sessions_grouped(
+    update: Update,
+    include_stale: bool = False,
+    stale_only: bool = False,
+):
+    """Core session listing logic with active/recent/stale grouping."""
     try:
         client = await ensure_client()
         sessions = await client.list_sessions()
@@ -569,32 +756,71 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No sessions found.")
             return
 
-        # Sort by modified time descending
-        sessions.sort(key=lambda s: s.modifiedTime or "", reverse=True)
+        # Update device registry with latest session list
+        try:
+            update_device_entry(state.device_name, sessions)
+        except Exception as e:
+            logger.debug(f"Could not update device registry: {e}")
 
-        lines = [f"📋 <b>Sessions</b> ({len(sessions)} total)\n"]
+        # Classify sessions
+        now = datetime.now(timezone.utc)
+        groups: dict[str, list] = {"active": [], "recent": [], "stale": []}
+        for s in sessions:
+            cat = classify_session(s, now)
+            groups[cat].append(s)
+
+        # Sort each group by modified time descending
+        for g in groups.values():
+            g.sort(key=lambda s: s.modifiedTime or "", reverse=True)
+
+        # Determine which groups to show
+        if stale_only:
+            show_groups = [("🗄️ Stale", groups["stale"])]
+        elif include_stale:
+            show_groups = [
+                ("🟢 Active", groups["active"]),
+                ("🔵 Recent", groups["recent"]),
+                ("🗄️ Stale", groups["stale"]),
+            ]
+        else:
+            show_groups = [
+                ("🟢 Active", groups["active"]),
+                ("🔵 Recent", groups["recent"]),
+            ]
+
+        total_shown = sum(len(g) for _, g in show_groups)
+        hidden = len(sessions) - total_shown
+
+        header = f"📋 <b>Sessions on {escape(state.device_name)}</b>"
+        header += f" ({total_shown} shown"
+        if hidden > 0:
+            header += f", {hidden} hidden"
+        header += ")\n"
+
+        lines = [header]
         buttons = []
-        for i, s in enumerate(sessions[:20]):  # Limit to 20
-            sid_short = s.sessionId[:8]
-            summary = (s.summary or "—")[:60]
-            age = format_time_ago(s.modifiedTime)
-            cwd = ""
-            if s.context and s.context.cwd:
-                cwd = s.context.cwd.split("\\")[-1] or s.context.cwd.split("/")[-1]
-                cwd = f" 📁{cwd}"
+        count = 0
 
-            marker = "▶️" if s.sessionId == state.current_session_id else "  "
-            lines.append(
-                f"{marker}<code>{sid_short}</code> {escape(summary)}"
-                f"\n    <i>{age}{cwd}</i>"
-            )
+        for label, group in show_groups:
+            if not group:
+                continue
+            lines.append(f"\n<b>{label}</b> ({len(group)})")
+            for s in group[:15]:  # Cap per group
+                is_current = s.sessionId == state.current_session_id
+                lines.append(_format_session_line(s, state.device_name, is_current))
 
-            # Inline keyboard button to switch to this session
-            btn_label = f"{sid_short} — {(s.summary or '—')[:30]}"
-            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"switch:{s.sessionId}")])
+                btn_label = f"{s.sessionId[:8]} — {get_session_display_name(s)[:30]}"
+                buttons.append([InlineKeyboardButton(
+                    btn_label, callback_data=f"switch:{s.sessionId}"
+                )])
+                count += 1
+                if count >= 30:
+                    break
+            if len(group) > 15:
+                lines.append(f"  <i>...and {len(group) - 15} more</i>")
 
-        if len(sessions) > 20:
-            lines.append(f"\n<i>...and {len(sessions) - 20} more</i>")
+        if hidden > 0 and not include_stale:
+            lines.append(f"\n<i>💡 {hidden} stale session(s) hidden. Use /all or /stale to see them.</i>")
 
         keyboard = InlineKeyboardMarkup(buttons) if buttons else None
 
@@ -611,6 +837,27 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Set up background watchers for recently active sessions
     asyncio.create_task(watch_active_sessions())
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /list command — list active and recent sessions (hides stale >1mo)."""
+    if not is_authorized(update):
+        return
+    await _list_sessions_grouped(update, include_stale=False)
+
+
+async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /all command — list all sessions including stale."""
+    if not is_authorized(update):
+        return
+    await _list_sessions_grouped(update, include_stale=True)
+
+
+async def cmd_stale(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stale command — show only stale/old sessions."""
+    if not is_authorized(update):
+        return
+    await _list_sessions_grouped(update, stale_only=True)
 
 
 async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -647,24 +894,13 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No sessions active in the last {days} day(s).")
             return
 
-        lines = [f"📋 <b>Active Sessions</b> (last {days}d): {len(recent)}\n"]
+        lines = [f"📋 <b>Active Sessions on {escape(state.device_name)}</b> (last {days}d): {len(recent)}\n"]
         buttons = []
         for s in recent[:20]:
-            sid_short = s.sessionId[:8]
-            summary = (s.summary or "—")[:60]
-            age = format_time_ago(s.modifiedTime)
-            cwd = ""
-            if s.context and s.context.cwd:
-                cwd = s.context.cwd.split("\\")[-1] or s.context.cwd.split("/")[-1]
-                cwd = f" 📁{cwd}"
+            is_current = s.sessionId == state.current_session_id
+            lines.append(_format_session_line(s, state.device_name, is_current))
 
-            marker = "▶️" if s.sessionId == state.current_session_id else "  "
-            lines.append(
-                f"{marker}<code>{sid_short}</code> {escape(summary)}"
-                f"\n    <i>{age}{cwd}</i>"
-            )
-
-            btn_label = f"{sid_short} — {(s.summary or '—')[:30]}"
+            btn_label = f"{s.sessionId[:8]} — {get_session_display_name(s)[:30]}"
             buttons.append([InlineKeyboardButton(btn_label, callback_data=f"switch:{s.sessionId}")])
 
         if len(recent) > 20:
@@ -1088,6 +1324,93 @@ async def _disconnect_session():
     state.event_chat_id = None
 
 
+async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /devices command — show all known devices and their sessions."""
+    if not is_authorized(update):
+        return
+
+    registry = load_device_registry()
+    if not registry:
+        await update.message.reply_text(
+            f"No devices registered yet.\n"
+            f"This device ({escape(state.device_name)}) will register when you use /list.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = [f"📟 <b>Known Devices</b> ({len(registry)})\n"]
+    for dev_name, info in sorted(registry.items()):
+        is_self = dev_name == state.device_name
+        marker = " ← <b>this device</b>" if is_self else ""
+        hostname = info.get("hostname", "?")
+        last_seen = info.get("last_seen", "")
+        session_count = len(info.get("sessions", []))
+        age = format_time_ago(last_seen) if last_seen else "unknown"
+        lines.append(
+            f"{'🟢' if is_self else '⚪'} <b>{escape(dev_name)}</b>{marker}\n"
+            f"    Host: {escape(hostname)} | {session_count} sessions | seen {age}"
+        )
+
+        # Show top 3 sessions from each device
+        for s in info.get("sessions", [])[:3]:
+            sid = (s.get("sessionId") or "")[:8]
+            summary = s.get("summary") or s.get("cwd", "").split("/")[-1] or "—"
+            lines.append(f"    • <code>{sid}</code> {escape(summary[:40])}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /name <name> — assign a display name to the current session."""
+    if not is_authorized(update):
+        return
+
+    if state.current_session is None or state.current_session_id is None:
+        await update.message.reply_text("No active session. Use /switch first.")
+        return
+
+    name = " ".join(context.args) if context.args else ""
+    if not name.strip():
+        await update.message.reply_text(
+            "Usage: /name &lt;display name&gt;\n"
+            "Example: <code>/name Frontend refactor</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    name = name.strip()[:60]
+    state.session_display_names[state.current_session_id] = name
+    _save_display_names()
+    await update.message.reply_text(
+        f"✅ Session <code>{state.current_session_id[:8]}</code> named: <b>{escape(name)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def _save_display_names():
+    """Persist user-assigned session display names to disk."""
+    path = Path.home() / ".copilot" / "session_display_names.json"
+    try:
+        path.write_text(json.dumps(state.session_display_names, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.debug(f"Could not save display names: {e}")
+
+
+def _load_display_names() -> dict[str, str]:
+    """Load persisted session display names."""
+    path = Path.home() / ".copilot" / "session_display_names.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard button presses from /list to switch sessions."""
     query = update.callback_query
@@ -1389,6 +1712,8 @@ def load_config() -> dict[str, Any]:
         config["copilot_log_level"] = env_log
     if env_users := os.environ.get("ALLOWED_USERNAMES"):
         config["allowed_usernames"] = [x.strip().lstrip("@") for x in env_users.split(",") if x.strip()]
+    if env_device := os.environ.get("DEVICE_NAME"):
+        config["device_name"] = env_device
 
     return config
 
@@ -1405,6 +1730,9 @@ def main():
 
     # Store config for use by ensure_client()
     state.config = config
+    state.device_name = get_device_name(config)
+    state.session_display_names = _load_display_names()
+    logger.info(f"Device name: {state.device_name}")
 
     # Parse allowed chat IDs
     allowed = config.get("allowed_usernames", [])
@@ -1419,11 +1747,15 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("all", cmd_all))
+    app.add_handler(CommandHandler("stale", cmd_stale))
     app.add_handler(CommandHandler("active", cmd_active))
     app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("send", cmd_send))
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
+    app.add_handler(CommandHandler("devices", cmd_devices))
+    app.add_handler(CommandHandler("name", cmd_name))
 
     # Handle inline keyboard button presses (e.g., session switch from /list)
     app.add_handler(CallbackQueryHandler(callback_switch, pattern=r"^switch:"))
