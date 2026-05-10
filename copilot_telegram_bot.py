@@ -351,13 +351,30 @@ state = BotState()
 # ── Access Control ───────────────────────────────────────────────────────────
 
 def is_authorized(update: Update) -> bool:
-    """Check if the user is authorized to use this bot."""
+    """Check if the user is authorized to use this bot.
+
+    As a side effect, captures the coordination chat ID from the
+    first authorized interaction so multi-device coordination works
+    without requiring an explicit /start.
+    """
     if not state.allowed_usernames:
+        _ensure_coordination_chat(update)
         return True
     user = update.effective_user
     if not user or not user.username:
         return False
-    return user.username.lower() in state.allowed_usernames
+    authorized = user.username.lower() in state.allowed_usernames
+    if authorized:
+        _ensure_coordination_chat(update)
+    return authorized
+
+
+def _ensure_coordination_chat(update: Update) -> None:
+    """Set the coordination chat ID from the first authorized interaction."""
+    if state._coordination_chat_id is None and update.effective_chat:
+        state._coordination_chat_id = update.effective_chat.id
+        _save_coordination_state()
+        logger.info(f"Coordination chat set to {state._coordination_chat_id}")
 
 
 # ── Copilot Client Management ───────────────────────────────────────────────
@@ -678,12 +695,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — Show this help",
         parse_mode=ParseMode.HTML,
     )
-
-    # Set coordination chat ID for multi-device coordination
-    if state._coordination_chat_id is None:
-        state._coordination_chat_id = update.effective_chat.id
-        _save_coordination_state()
-        logger.info(f"Coordination chat set to {state._coordination_chat_id}")
 
     # Announce online and update coordination pin
     if state.is_active and state._coordination_chat_id:
