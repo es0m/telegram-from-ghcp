@@ -24,7 +24,7 @@ Commands:
   /status        — Show current session info
   /send <msg>    — Send a prompt to the current session
   /disconnect    — Disconnect from current session
-  /devices       — Show known devices and their sessions
+  /devices       — Show this bot's device info
   /name <name>   — Set a display name for the current session
   /help          — Show available commands
 
@@ -60,7 +60,6 @@ import logging
 import os
 import platform
 import shutil
-import socket as _socket
 import sys
 import tempfile
 import traceback
@@ -182,59 +181,6 @@ def get_device_name(config: dict) -> str:
         except Exception:
             name = "unknown"
     return name
-
-
-# ── Device Registry ──────────────────────────────────────────────────────────
-
-DEVICE_REGISTRY_FILENAME = "device_registry.json"
-
-
-def _get_registry_path() -> Path:
-    """Path to the shared device registry under ~/.copilot/."""
-    return Path.home() / ".copilot" / DEVICE_REGISTRY_FILENAME
-
-
-def load_device_registry() -> dict:
-    """Load the device registry. Returns {device_name: {sessions: [...], ...}}."""
-    path = _get_registry_path()
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_device_registry(registry: dict) -> None:
-    """Persist the device registry."""
-    path = _get_registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(registry, indent=2), encoding="utf-8")
-
-
-def update_device_entry(device_name: str, sessions: list) -> None:
-    """Update this device's entry in the shared registry.
-
-    Each entry stores the device name, last seen timestamp, hostname,
-    and a list of session summaries.
-    """
-    registry = load_device_registry()
-    registry[device_name] = {
-        "hostname": platform.node(),
-        "last_seen": datetime.now(timezone.utc).isoformat(),
-        "sessions": [
-            {
-                "sessionId": s.sessionId,
-                "summary": s.summary,
-                "modifiedTime": s.modifiedTime,
-                "cwd": s.context.cwd if s.context else None,
-                "repository": s.context.repository if s.context else None,
-            }
-            for s in sessions[:50]  # cap to prevent unbounded growth
-        ],
-    }
-    save_device_registry(registry)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -706,7 +652,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — Current session info\n"
         "/send &lt;message&gt; — Send a prompt\n"
         "/name &lt;name&gt; — Set display name for current session\n"
-        "/devices — Show all known devices\n"
+        "/devices — Show this bot's device info\n"
         "/disconnect — Disconnect from session\n"
         "/help — Show this help",
         parse_mode=ParseMode.HTML,
@@ -755,12 +701,6 @@ async def _list_sessions_grouped(
         if not sessions:
             await update.message.reply_text("No sessions found.")
             return
-
-        # Update device registry with latest session list
-        try:
-            update_device_entry(state.device_name, sessions)
-        except Exception as e:
-            logger.debug(f"Could not update device registry: {e}")
 
         # Classify sessions
         now = datetime.now(timezone.utc)
@@ -1325,37 +1265,44 @@ async def _disconnect_session():
 
 
 async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /devices command — show all known devices and their sessions."""
+    """Handle /devices command — show this bot's device info and sessions.
+
+    When multiple bots connect to the same Telegram channel, each bot's
+    sessions are distinguished by the [device] prefix in session names.
+    Use /list to see this device's sessions.
+    """
     if not is_authorized(update):
         return
 
-    registry = load_device_registry()
-    if not registry:
-        await update.message.reply_text(
-            f"No devices registered yet.\n"
-            f"This device ({escape(state.device_name)}) will register when you use /list.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    try:
+        client = await ensure_client()
+        sessions = await client.list_sessions()
+    except Exception as e:
+        sessions = []
+        logger.debug(f"Could not list sessions for /devices: {e}")
 
-    lines = [f"📟 <b>Known Devices</b> ({len(registry)})\n"]
-    for dev_name, info in sorted(registry.items()):
-        is_self = dev_name == state.device_name
-        marker = " ← <b>this device</b>" if is_self else ""
-        hostname = info.get("hostname", "?")
-        last_seen = info.get("last_seen", "")
-        session_count = len(info.get("sessions", []))
-        age = format_time_ago(last_seen) if last_seen else "unknown"
-        lines.append(
-            f"{'🟢' if is_self else '⚪'} <b>{escape(dev_name)}</b>{marker}\n"
-            f"    Host: {escape(hostname)} | {session_count} sessions | seen {age}"
-        )
+    now = datetime.now(timezone.utc)
+    active = sum(1 for s in sessions if classify_session(s, now) == "active")
+    recent = sum(1 for s in sessions if classify_session(s, now) == "recent")
+    stale = sum(1 for s in sessions if classify_session(s, now) == "stale")
 
-        # Show top 3 sessions from each device
-        for s in info.get("sessions", [])[:3]:
-            sid = (s.get("sessionId") or "")[:8]
-            summary = s.get("summary") or s.get("cwd", "").split("/")[-1] or "—"
-            lines.append(f"    • <code>{sid}</code> {escape(summary[:40])}")
+    lines = [
+        f"📟 <b>This Bot</b>\n",
+        f"<b>Device:</b> {escape(state.device_name)}",
+        f"<b>Hostname:</b> {escape(platform.node())}",
+        f"<b>Sessions:</b> {len(sessions)} total "
+        f"(🟢 {active} active, 🔵 {recent} recent, 🗄️ {stale} stale)",
+    ]
+
+    if state.current_session_id:
+        sid_short = state.current_session_id[:8]
+        lines.append(f"<b>Connected:</b> <code>{sid_short}</code>")
+
+    lines.append(
+        f"\n<i>💡 Multiple bots can post to this channel. "
+        f"Each bot prefixes sessions with its device name "
+        f"(<code>[{escape(state.device_name)}]</code>) for clarity.</i>"
+    )
 
     await update.message.reply_text(
         "\n".join(lines),

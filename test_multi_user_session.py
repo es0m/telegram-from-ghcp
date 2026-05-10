@@ -41,9 +41,6 @@ from copilot_telegram_bot import (
     classify_session,
     get_session_display_name,
     get_device_name,
-    load_device_registry,
-    save_device_registry,
-    update_device_entry,
     STALE_THRESHOLD_DAYS,
 )
 
@@ -143,45 +140,6 @@ class TestDeviceName:
         name = get_device_name({})
         assert name == platform.node()
 
-
-class TestDeviceRegistry:
-    """Test the device registry load/save/update."""
-
-    def test_round_trip(self, tmp_path, monkeypatch):
-        registry_path = tmp_path / "device_registry.json"
-        monkeypatch.setattr(
-            "copilot_telegram_bot._get_registry_path",
-            lambda: registry_path,
-        )
-        assert load_device_registry() == {}
-
-        registry = {"dev-a": {"hostname": "a", "sessions": []}}
-        save_device_registry(registry)
-
-        loaded = load_device_registry()
-        assert loaded["dev-a"]["hostname"] == "a"
-
-    def test_update_entry(self, tmp_path, monkeypatch):
-        registry_path = tmp_path / "device_registry.json"
-        monkeypatch.setattr(
-            "copilot_telegram_bot._get_registry_path",
-            lambda: registry_path,
-        )
-
-        mock_session = MagicMock()
-        mock_session.sessionId = "sess-123"
-        mock_session.summary = "Test session"
-        mock_session.modifiedTime = "2026-05-10T12:00:00Z"
-        mock_session.context = MagicMock()
-        mock_session.context.cwd = "/home/dev"
-        mock_session.context.repository = "org/repo"
-
-        update_device_entry("laptop", [mock_session])
-
-        registry = load_device_registry()
-        assert "laptop" in registry
-        assert len(registry["laptop"]["sessions"]) == 1
-        assert registry["laptop"]["sessions"][0]["sessionId"] == "sess-123"
 
 
 # ---------------------------------------------------------------------------
