@@ -321,14 +321,8 @@ class BotState:
         self.device_name: str = ""
         # User-assigned display names: session_id → name
         self.session_display_names: dict[str, str] = {}
-        self._delta_buffer: str = ""
-        self._delta_message_id: Optional[int] = None
-        # Lock for async operations
-        self._lock = asyncio.Lock()
-        # Event loop reference for thread-safe callbacks
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Background session watchers: session_id → WatchedSession
-        self.watched_sessions: dict[str, "WatchedSession"] = {}
+        # Original working directory — restored on disconnect/exit
+        self._original_cwd: str = os.getcwd()
         # Multi-device coordination
         self.is_active: bool = False  # True if this instance is the active poller
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -905,10 +899,19 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _chdir_to_session(meta) -> None:
-    """Change the process working directory to the session's cwd."""
+    """Change the process working directory to the session's cwd.
+
+    The original cwd is saved in state._original_cwd and restored
+    when disconnecting from the session.
+    """
     if meta and meta.context and meta.context.cwd:
         target = meta.context.cwd
         if os.path.isdir(target):
+            # Save current dir before switching (if not already saved)
+            try:
+                state._original_cwd = os.getcwd()
+            except OSError:
+                pass
             os.chdir(target)
             logger.info(f"Changed directory to {target}")
         else:
@@ -1285,7 +1288,7 @@ async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _disconnect_session():
-    """Internal: disconnect from the current session."""
+    """Internal: disconnect from the current session and restore original cwd."""
     if state.unsubscribe_fn:
         try:
             state.unsubscribe_fn()
@@ -1303,6 +1306,14 @@ async def _disconnect_session():
     state.current_session_id = None
     state.current_session_meta = None
     state.event_chat_id = None
+
+    # Restore original working directory
+    if state._original_cwd:
+        try:
+            os.chdir(state._original_cwd)
+            logger.info(f"Restored working directory to {state._original_cwd}")
+        except OSError:
+            pass
 
 
 async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
