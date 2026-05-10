@@ -906,16 +906,21 @@ def _chdir_to_session(meta) -> None:
     """
     if meta and meta.context and meta.context.cwd:
         target = meta.context.cwd
+        logger.info(f"Session CWD from metadata: {target}")
         if os.path.isdir(target):
             # Save current dir before switching (if not already saved)
             try:
                 state._original_cwd = os.getcwd()
+                logger.info(f"Saved original CWD: {state._original_cwd}")
             except OSError:
                 pass
             os.chdir(target)
-            logger.info(f"Changed directory to {target}")
+            logger.info(f"Changed directory to {target} (verified: {os.getcwd()})")
         else:
             logger.warning(f"Session cwd does not exist: {target}")
+    else:
+        cwd_val = getattr(getattr(meta, 'context', None), 'cwd', None) if meta else None
+        logger.info(f"No CWD in session metadata (meta={meta is not None}, cwd={cwd_val})")
 
 
 def _repair_session_file(session_id: str) -> bool:
@@ -2021,18 +2026,24 @@ def main():
         state._coordination_chat_id = config["coordination_chat_id"]
 
     # Main active/standby loop
+    _conflict_backoff = 0  # seconds to wait after a Conflict before retrying
     while True:
         # Check if we should start as active or standby
         should_be_active = asyncio.run(_check_should_activate(token))
 
-        if should_be_active:
+        if should_be_active and _conflict_backoff == 0:
             state.is_active = True
             logger.info("Starting in ACTIVE mode")
             _run_active(token, config)
-            # If we get here, polling stopped (handoff or error)
+            # If we get here, polling stopped (handoff, conflict, or error)
             logger.info("Active polling ended")
+            if not state.is_active:
+                # Conflict or handoff — wait before retrying
+                _conflict_backoff = STANDBY_CHECK_INTERVAL
+                logger.info(f"Will enter standby for {_conflict_backoff}s before retrying")
             state.is_active = False
         else:
+            _conflict_backoff = 0  # reset for next cycle
             logger.info("Starting in STANDBY mode")
             # Run standby loop — blocks until we should activate
             try:
@@ -2103,13 +2114,32 @@ async def _run_standby(token: str):
 def _run_active(token: str, config: dict):
     """Run in active mode with full Telegram polling.
 
-    If another instance is already polling (Conflict error), catches the
-    exception and returns so the main loop can fall through to standby.
+    If another instance is already polling (Conflict error), an error
+    handler catches it and stops the application, falling through to standby.
     """
     from telegram.error import Conflict, NetworkError
 
+    async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Application error handler — catch Conflict and stop polling."""
+        error = context.error
+        if isinstance(error, Conflict) or (
+            isinstance(error, NetworkError) and "conflict" in str(error).lower()
+        ):
+            logger.warning(
+                "Conflict: another bot instance is already polling — entering standby"
+            )
+            state.is_active = False
+            if state.app:
+                state.app.stop_running()
+            return
+        # Log other errors normally
+        logger.error(f"Unhandled error: {error}", exc_info=context.error)
+
     # Build Telegram application
     app = Application.builder().token(token).post_init(_active_post_init).post_shutdown(_active_post_shutdown).build()
+
+    # Register error handler (must be before run_polling)
+    app.add_error_handler(_on_error)
 
     # Register command handlers
     app.add_handler(CommandHandler("start", cmd_start))
@@ -2139,21 +2169,7 @@ def _run_active(token: str, config: dict):
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
     logger.info("Starting Copilot Sessions Telegram Bot (ACTIVE)...")
-    try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-    except Conflict:
-        logger.warning(
-            "Conflict: another bot instance is already polling — entering standby"
-        )
-        state.is_active = False
-    except NetworkError as e:
-        if "conflict" in str(e).lower():
-            logger.warning(
-                "Conflict (NetworkError): another instance polling — entering standby"
-            )
-            state.is_active = False
-        else:
-            raise
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
