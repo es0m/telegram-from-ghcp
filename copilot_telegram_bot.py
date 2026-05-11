@@ -2197,10 +2197,10 @@ def _run_active(token: str, config: dict):
             coord = await _read_pinned_coordination(context.bot)
             if coord:
                 target = coord.get("target", "")
-                if target.lower() == state.device_name.lower():
+                if target == "*" or target.lower() == state.device_name.lower():
                     logger.warning(
-                        f"Conflict but we are the designated device — "
-                        f"retrying (attempt {_conflict_count})"
+                        f"Conflict but we are the designated device "
+                        f"(target='{target}') — retrying (attempt {_conflict_count})"
                     )
                     # Don't step back; the polling loop will retry automatically
                     return
