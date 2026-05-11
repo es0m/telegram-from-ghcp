@@ -326,6 +326,7 @@ class BotState:
         self._original_cwd: str = os.getcwd()
         # Multi-device coordination
         self.is_active: bool = False  # True if this instance is the active poller
+        self._yielded: bool = False   # True after /yield — skip wildcard activation
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._standby_task: Optional[asyncio.Task] = None
         self._coordination_chat_id: Optional[int] = None  # chat ID for pinned message
@@ -1946,6 +1947,7 @@ async def cmd_yield(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _announce_offline(context.bot, update.effective_chat.id)
 
     state.is_active = False
+    state._yielded = True  # prevent re-claiming wildcard
     state.app.stop_running()
 
 
@@ -2134,10 +2136,14 @@ async def _check_should_activate(token: str) -> bool:
 
         # We're the target
         if target.lower() == state.device_name.lower():
+            state._yielded = False  # explicit activation clears yield
             return True
 
-        # Wildcard
+        # Wildcard — but not if we just yielded (let others claim first)
         if target == "*":
+            if state._yielded:
+                logger.debug("Wildcard target but we yielded — staying standby")
+                return False
             return True
 
         # Stale heartbeat (crashed active)
@@ -2147,6 +2153,7 @@ async def _check_should_activate(token: str) -> bool:
                 age = (datetime.now(timezone.utc) - ts).total_seconds()
                 if age > HEARTBEAT_STALE_THRESHOLD:
                     logger.info(f"Stale heartbeat ({age:.0f}s) — claiming active")
+                    state._yielded = False  # crash recovery clears yield
                     return True
             except Exception:
                 pass
