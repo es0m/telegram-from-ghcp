@@ -1316,6 +1316,8 @@ async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _disconnect_session():
     """Internal: disconnect from the current session and restore original cwd."""
+    session_id = state.current_session_id
+
     if state.unsubscribe_fn:
         try:
             state.unsubscribe_fn()
@@ -1329,6 +1331,12 @@ async def _disconnect_session():
         except Exception:
             pass
 
+    # Clean up inuse lock file left by the headless CLI process.
+    # The SDK's disconnect() doesn't remove it, so the CLI warns
+    # "in use by another CLI" for sessions we've already released.
+    if session_id:
+        _cleanup_inuse_lock(session_id)
+
     state.current_session = None
     state.current_session_id = None
     state.current_session_meta = None
@@ -1341,6 +1349,29 @@ async def _disconnect_session():
             logger.info(f"Restored working directory to {state._original_cwd}")
         except OSError:
             pass
+
+
+def _cleanup_inuse_lock(session_id: str):
+    """Remove inuse.<PID>.lock for our headless CLI process."""
+    cli_pid = None
+    try:
+        if state.client and state.client._process:
+            cli_pid = state.client._process.pid
+    except Exception:
+        pass
+    if not cli_pid:
+        return
+
+    session_dir = os.path.expanduser(
+        f"~/.copilot/session-state/{session_id}"
+    )
+    lock_file = os.path.join(session_dir, f"inuse.{cli_pid}.lock")
+    try:
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+            logger.info(f"Removed lock file: {lock_file}")
+    except OSError as e:
+        logger.debug(f"Could not remove lock file {lock_file}: {e}")
 
 
 async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
