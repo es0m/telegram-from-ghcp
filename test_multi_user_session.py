@@ -21,11 +21,14 @@ Run:
 """
 
 import asyncio
+import json
 import os
 import platform
 import shutil
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -37,6 +40,7 @@ import pytest
 
 # Import the bot's helper functions for unit testing
 sys.path.insert(0, os.path.dirname(__file__))
+import copilot_telegram_bot as bot_module
 from copilot_telegram_bot import (
     classify_session,
     get_session_display_name,
@@ -139,6 +143,174 @@ class TestDeviceName:
         monkeypatch.delenv("DEVICE_NAME", raising=False)
         name = get_device_name({})
         assert name == platform.node()
+
+
+class TestMainLoopRecovery:
+    """Test that startup network failures do not crash the bot process."""
+
+    def test_main_recovers_from_startup_timeout(self, monkeypatch):
+        calls = {"active": 0, "standby_delays": [], "activate_checks": 0}
+
+        monkeypatch.setattr(bot_module, "load_config", lambda: {"telegram_bot_token": "test-token"})
+        monkeypatch.setattr(bot_module, "get_device_name", lambda _: "test-device")
+        monkeypatch.setattr(bot_module, "_load_display_names", lambda: {})
+        monkeypatch.setattr(bot_module, "_load_coordination_state", lambda: None)
+
+        async def fake_check_should_activate(token: str) -> bool:
+            calls["activate_checks"] += 1
+            return True
+
+        def fake_run_active(token: str, config: dict):
+            calls["active"] += 1
+            raise bot_module.telegram.error.TimedOut("startup timeout")
+
+        async def fake_run_standby(token: str, initial_delay: int = 0):
+            calls["standby_delays"].append(initial_delay)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(bot_module, "_check_should_activate", fake_check_should_activate)
+        monkeypatch.setattr(bot_module, "_run_active", fake_run_active)
+        monkeypatch.setattr(bot_module, "_run_standby", fake_run_standby)
+
+        bot_module.main()
+
+        assert calls["active"] == 1
+        assert calls["activate_checks"] >= 2
+        assert calls["standby_delays"] == [bot_module.STANDBY_CHECK_INTERVAL]
+
+
+class TestCoordinationPinUpdates:
+    """Test takeover and persistence behavior for coordination pin updates."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_state(self):
+        tracked = [
+            "_coordination_chat_id",
+            "_pinned_message_id",
+            "device_name",
+            "is_active",
+            "app",
+            "_loop",
+            "_heartbeat_task",
+        ]
+        snapshot = {name: getattr(bot_module.state, name) for name in tracked}
+        yield
+        for name, value in snapshot.items():
+            setattr(bot_module.state, name, value)
+
+    @pytest.mark.asyncio
+    async def test_update_coordination_pin_reuses_current_pinned_message(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(bot_module, "COORD_STATE_FILE", tmp_path / "coord.json")
+        bot_module.state._coordination_chat_id = 123
+        bot_module.state._pinned_message_id = None
+
+        existing_text = bot_module._build_coord_message("old-device", "new-device", 2)
+
+        class FakeBot:
+            def __init__(self):
+                self.edited_message_id = None
+                self.send_count = 0
+
+            async def get_chat(self, chat_id):
+                return SimpleNamespace(
+                    pinned_message=SimpleNamespace(message_id=987, text=existing_text)
+                )
+
+            async def edit_message_text(self, text, chat_id, message_id):
+                self.edited_message_id = message_id
+
+            async def send_message(self, chat_id, text):
+                self.send_count += 1
+                return SimpleNamespace(message_id=111)
+
+            async def pin_chat_message(self, chat_id, message_id, disable_notification=True):
+                return None
+
+        bot = FakeBot()
+        await bot_module._update_coordination_pin(bot, "new-device", "new-device", 4)
+
+        assert bot.edited_message_id == 987
+        assert bot.send_count == 0
+        assert bot_module.state._pinned_message_id == 987
+
+    @pytest.mark.asyncio
+    async def test_update_coordination_pin_recreates_when_stored_id_is_stale(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(bot_module, "COORD_STATE_FILE", tmp_path / "coord.json")
+        bot_module.state._coordination_chat_id = 123
+        bot_module.state._pinned_message_id = 555
+
+        class FakeBot:
+            def __init__(self):
+                self.edit_count = 0
+                self.send_count = 0
+                self.pin_count = 0
+
+            async def get_chat(self, chat_id):
+                return SimpleNamespace(pinned_message=None)
+
+            async def edit_message_text(self, text, chat_id, message_id):
+                self.edit_count += 1
+                raise bot_module.telegram.error.BadRequest("Message to edit not found")
+
+            async def send_message(self, chat_id, text):
+                self.send_count += 1
+                return SimpleNamespace(message_id=777)
+
+            async def pin_chat_message(self, chat_id, message_id, disable_notification=True):
+                self.pin_count += 1
+
+        bot = FakeBot()
+        await bot_module._update_coordination_pin(bot, "new-device", "new-device", 6)
+
+        assert bot.edit_count == 1
+        assert bot.send_count == 1
+        assert bot.pin_count == 1
+        assert bot_module.state._pinned_message_id == 777
+
+    @pytest.mark.asyncio
+    async def test_active_post_init_updates_pin_immediately(self, monkeypatch):
+        bot_module.state._coordination_chat_id = 777
+        bot_module.state.device_name = "new-device"
+
+        calls = []
+
+        async def fake_get_session_count():
+            return 9
+
+        async def fake_update_coordination_pin(bot, active, target, sessions=0):
+            calls.append((bot, active, target, sessions))
+
+        async def fake_heartbeat_loop():
+            return None
+
+        monkeypatch.setattr(bot_module, "_get_session_count", fake_get_session_count)
+        monkeypatch.setattr(bot_module, "_update_coordination_pin", fake_update_coordination_pin)
+        monkeypatch.setattr(bot_module, "_heartbeat_loop", fake_heartbeat_loop)
+
+        app = SimpleNamespace(bot=object())
+        await bot_module._active_post_init(app)
+        await bot_module.state._heartbeat_task
+
+        assert calls == [(app.bot, "new-device", "new-device", 9)]
+        assert bot_module.state.is_active is True
+        assert bot_module.state.app is app
+
+    def test_save_coordination_state_clears_stale_pinned_id(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(bot_module, "COORD_STATE_FILE", tmp_path / "coord.json")
+        bot_module.state._coordination_chat_id = 321
+        bot_module.state._pinned_message_id = 999
+        bot_module._save_coordination_state()
+
+        bot_module.state._pinned_message_id = None
+        bot_module._save_coordination_state()
+
+        data = json.loads((tmp_path / "coord.json").read_text(encoding="utf-8"))
+        assert data["chat_id"] == 321
+        assert "pinned_message_id" not in data
 
 
 
@@ -280,6 +452,170 @@ class TestMultiUserSession:
         finally:
             await client_a.stop()
             await client_b.stop()
+
+    async def test_bot_do_resume_switches_process_cwd_to_selected_session(self):
+        """Bot switch path must route tool execution to the selected session cwd."""
+        repo_root = Path(__file__).resolve().parent
+        target_dir = repo_root / "test"
+        created_target_dir = False
+        if not target_dir.exists():
+            target_dir.mkdir(parents=True, exist_ok=True)
+            created_target_dir = True
+
+        original_cwd = Path.cwd()
+        tracked_state = [
+            "client",
+            "current_session",
+            "current_session_id",
+            "current_session_meta",
+            "unsubscribe_fn",
+            "event_chat_id",
+            "app",
+            "config",
+            "_loop",
+            "watched_sessions",
+            "_original_cwd",
+        ]
+        snapshot = {name: getattr(bot_module.state, name) for name in tracked_state}
+
+        root_session_id: str | None = None
+        target_session_id: str | None = None
+        root_session = None
+        target_session = None
+        client = None
+        try:
+            bot_module.state.client = None
+            bot_module.state.current_session = None
+            bot_module.state.current_session_id = None
+            bot_module.state.current_session_meta = None
+            bot_module.state.unsubscribe_fn = None
+            bot_module.state.event_chat_id = None
+            bot_module.state.app = None
+            bot_module.state.watched_sessions = {}
+            bot_module.state.config = {"copilot_log_level": "none"}
+            bot_module.state._loop = asyncio.get_running_loop()
+            bot_module.state._original_cwd = str(original_cwd)
+
+            client = await bot_module.ensure_client()
+
+            async def _wait_for_listed_meta(session_id: str, timeout_seconds: int = 30):
+                for _ in range(timeout_seconds):
+                    sessions = await client.list_sessions()
+                    match = next((s for s in sessions if s.sessionId == session_id), None)
+                    if match is not None:
+                        return match
+                    await asyncio.sleep(1)
+                return None
+
+            root_session = await client.create_session(
+                on_permission_request=PermissionHandler.approve_all,
+                working_directory=str(repo_root),
+            )
+            root_session_id = root_session.session_id
+
+            target_session = await client.create_session(
+                on_permission_request=PermissionHandler.approve_all,
+                working_directory=str(target_dir),
+            )
+            target_session_id = target_session.session_id
+
+            # Persist both sessions so they can be resumed as existing sessions.
+            await root_session.send_and_wait("seed root session", timeout=120)
+            await target_session.send_and_wait("seed target session", timeout=120)
+            await root_session.disconnect()
+            await target_session.disconnect()
+            root_session = None
+            target_session = None
+
+            # Simulate bot restart so resume_session runs against existing sessions.
+            await client.stop()
+            bot_module.state.client = None
+            client = await bot_module.ensure_client()
+
+            root_meta = await _wait_for_listed_meta(root_session_id)
+            target_meta = await _wait_for_listed_meta(target_session_id)
+            if root_meta is None:
+                root_meta = SimpleNamespace(
+                    sessionId=root_session_id,
+                    summary="root-session",
+                    modifiedTime=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    context=SimpleNamespace(
+                        cwd=str(repo_root),
+                        gitRoot=str(repo_root),
+                        repository="es0m/telegram-from-ghcp",
+                        branch="main",
+                    ),
+                )
+            if target_meta is None:
+                target_meta = SimpleNamespace(
+                    sessionId=target_session_id,
+                    summary="target-session",
+                    modifiedTime=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    context=SimpleNamespace(
+                        cwd=str(target_dir),
+                        gitRoot=str(target_dir),
+                        repository="es0m/telegram-from-ghcp",
+                        branch="main",
+                    ),
+                )
+
+            # Exercise the same switch path used by /switch and callback_switch.
+            await bot_module._do_resume(root_session_id, chat_id=1, pre_meta=root_meta)
+            await bot_module._do_resume(target_session_id, chat_id=1, pre_meta=target_meta)
+
+            assert bot_module.state.current_session_id == target_session_id
+            assert Path.cwd().resolve() == target_dir.resolve()
+
+            # Verify the session tool cwd is actually the selected session directory.
+            response_event = await bot_module.state.current_session.send_and_wait(
+                "Use the powershell tool and run exactly: "
+                "Get-Location | Select-Object -ExpandProperty Path. "
+                "Reply with only that path.",
+                timeout=120,
+            )
+            response_text = getattr(getattr(response_event, "data", None), "content", "") or ""
+            normalized_response = (
+                response_text.replace("\\\\", "\\").replace("\\", "/").strip().lower()
+            )
+            normalized_target = str(target_dir).replace("\\", "/").lower()
+            assert normalized_target in normalized_response, (
+                f"Expected cwd '{target_dir}', got response: {response_text!r}"
+            )
+        finally:
+            try:
+                await bot_module._disconnect_session()
+            except Exception:
+                pass
+
+            for session in (root_session, target_session):
+                if session is not None:
+                    try:
+                        await session.disconnect()
+                    except Exception:
+                        pass
+
+            if client is not None:
+                for sid in (root_session_id, target_session_id):
+                    if sid:
+                        try:
+                            await client.delete_session(sid)
+                        except Exception:
+                            pass
+                try:
+                    await client.stop()
+                except Exception:
+                    pass
+
+            if created_target_dir:
+                try:
+                    if target_dir.exists() and not any(target_dir.iterdir()):
+                        target_dir.rmdir()
+                except OSError:
+                    pass
+
+            os.chdir(original_cwd)
+            for name, value in snapshot.items():
+                setattr(bot_module.state, name, value)
 
 
 if __name__ == "__main__":

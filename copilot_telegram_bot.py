@@ -63,6 +63,7 @@ import logging
 import os
 import platform
 import shutil
+import sqlite3
 import sys
 import tempfile
 import traceback
@@ -160,6 +161,8 @@ def get_session_display_name(meta, device_name: str = "") -> str:
       4. Session ID prefix
     """
     name = ""
+    session_id = getattr(meta, "sessionId", "")
+    resolved = _resolve_session_context(session_id, meta)
 
     # 1. Summary
     if meta.summary:
@@ -169,16 +172,16 @@ def get_session_display_name(meta, device_name: str = "") -> str:
             name = name[:57] + "…"
 
     # 2. Repository
-    if not name and meta.context and meta.context.repository:
-        repo = meta.context.repository
+    if not name and resolved.get("repository"):
+        repo = resolved["repository"]
         # "owner/repo" → "repo"
         if "/" in repo:
             repo = repo.split("/")[-1]
         name = repo
 
     # 3. CWD basename
-    if not name and meta.context and meta.context.cwd:
-        cwd = meta.context.cwd
+    if not name and resolved.get("cwd"):
+        cwd = resolved["cwd"]
         basename = Path(cwd).name
         if basename:
             name = basename
@@ -509,47 +512,77 @@ async def _notify_background_update(session_id: str):
         logger.error(f"Failed to send background notification: {e}")
 
 
+async def _clear_background_watchers() -> None:
+    """Disconnect all background-watched sessions."""
+    watched_items = list(state.watched_sessions.items())
+    state.watched_sessions.clear()
+
+    for sid, watched in watched_items:
+        try:
+            watched.unsub()
+        except Exception:
+            pass
+        try:
+            await watched.session.disconnect()
+        except Exception as e:
+            logger.debug(f"Could not disconnect watched session {sid[:8]}: {e}")
+
+
 async def watch_active_sessions():
     """Subscribe to events on recently active sessions for background notifications."""
     try:
-        client = await ensure_client()
-        sessions = await client.list_sessions()
-        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        async with state._lock:
+            # Avoid mutating client/session state while a foreground session is connected.
+            if state.current_session_id:
+                return
 
-        for s in sessions:
-            sid = s.sessionId
-            # Skip if already watching or is the current session
-            if sid in state.watched_sessions or sid == state.current_session_id:
-                continue
-            if not s.modifiedTime:
-                continue
-            try:
-                mod = datetime.fromisoformat(s.modifiedTime.replace("Z", "+00:00"))
-                if mod < cutoff:
+            client = await ensure_client()
+            sessions = await client.list_sessions()
+            db_contexts = _load_db_session_context_map()
+            cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+
+            for s in sessions:
+                sid = s.sessionId
+                # Skip if already watching or is the current session
+                if sid in state.watched_sessions or sid == state.current_session_id:
                     continue
-            except Exception:
-                continue
+                if not s.modifiedTime:
+                    continue
+                try:
+                    mod = datetime.fromisoformat(s.modifiedTime.replace("Z", "+00:00"))
+                    if mod < cutoff:
+                        continue
+                except Exception:
+                    continue
 
-            # Resume and subscribe
-            try:
-                _repair_session_file(sid)
-                session = await client.resume_session(
-                    sid,
-                    on_permission_request=PermissionHandler.approve_all,
-                )
-                handler = _make_background_handler(sid)
-                unsub = session.on(handler)
-                watched = WatchedSession(
-                    session_id=sid,
-                    summary=(s.summary or "—")[:60],
-                    session=session,
-                    unsub=unsub,
-                )
-                state.watched_sessions[sid] = watched
-            except Exception as e:
-                logger.debug(f"Could not watch session {sid[:8]}: {e}")
+                # Resume and subscribe
+                try:
+                    pre_context = _resolve_session_context(
+                        sid,
+                        s,
+                        db_contexts=db_contexts,
+                    )
+                    resume_cwd = pre_context.get("cwd")
+                    _repair_session_file(sid)
+                    session = await client.resume_session(
+                        sid,
+                        on_permission_request=PermissionHandler.approve_all,
+                        working_directory=resume_cwd,
+                    )
+                    _restore_workspace_context(sid, pre_context, reason="background-watch resume")
+                    handler = _make_background_handler(sid)
+                    unsub = session.on(handler)
+                    watched = WatchedSession(
+                        session_id=sid,
+                        summary=(s.summary or "—")[:60],
+                        session=session,
+                        unsub=unsub,
+                    )
+                    state.watched_sessions[sid] = watched
+                except Exception as e:
+                    logger.debug(f"Could not watch session {sid[:8]}: {e}")
 
-        logger.info(f"Watching {len(state.watched_sessions)} background sessions")
+            logger.info(f"Watching {len(state.watched_sessions)} background sessions")
     except Exception as e:
         logger.error(f"Error setting up background watchers: {e}")
 
@@ -713,7 +746,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
 
 
-def _format_session_line(s, device_name: str, is_current: bool = False) -> str:
+def _format_session_line(
+    s,
+    device_name: str,
+    is_current: bool = False,
+    db_contexts: Optional[dict[str, dict[str, str]]] = None,
+) -> str:
     """Format a single session as a Telegram HTML line."""
     sid_short = s.sessionId[:8]
     display = get_session_display_name(s, device_name="")
@@ -721,14 +759,16 @@ def _format_session_line(s, device_name: str, is_current: bool = False) -> str:
     if s.sessionId in state.session_display_names:
         display = state.session_display_names[s.sessionId]
     age = format_time_ago(s.modifiedTime)
+    resolved = _resolve_session_context(s.sessionId, s, db_contexts=db_contexts)
 
     cwd_line = ""
-    if s.context and s.context.cwd:
-        cwd_line = f"\n    📁 <code>{escape(s.context.cwd)}</code>"
+    if resolved.get("cwd"):
+        cwd_line = f"\n    📁 <code>{escape(resolved['cwd'])}</code>"
 
     branch_tag = ""
-    if s.context and s.context.branch:
-        branch_tag = f" 🌿{escape(s.context.branch)}"
+    branch = resolved.get("branch")
+    if branch:
+        branch_tag = f" 🌿{escape(branch)}"
 
     marker = "▶️" if is_current else "  "
     return (
@@ -746,6 +786,7 @@ async def _list_sessions_grouped(
     try:
         client = await ensure_client()
         sessions = await client.list_sessions()
+        db_contexts = _load_db_session_context_map()
 
         if not sessions:
             await update.message.reply_text("No sessions found.")
@@ -796,7 +837,14 @@ async def _list_sessions_grouped(
             lines.append(f"\n<b>{label}</b> ({len(group)})")
             for s in group[:15]:  # Cap per group
                 is_current = s.sessionId == state.current_session_id
-                lines.append(_format_session_line(s, state.device_name, is_current))
+                lines.append(
+                    _format_session_line(
+                        s,
+                        state.device_name,
+                        is_current,
+                        db_contexts=db_contexts,
+                    )
+                )
 
                 btn_label = f"{s.sessionId[:8]} — {get_session_display_name(s)[:30]}"
                 buttons.append([InlineKeyboardButton(
@@ -865,6 +913,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         client = await ensure_client()
         sessions = await client.list_sessions()
+        db_contexts = _load_db_session_context_map()
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         recent = []
@@ -887,7 +936,14 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = []
         for s in recent[:20]:
             is_current = s.sessionId == state.current_session_id
-            lines.append(_format_session_line(s, state.device_name, is_current))
+            lines.append(
+                _format_session_line(
+                    s,
+                    state.device_name,
+                    is_current,
+                    db_contexts=db_contexts,
+                )
+            )
 
             btn_label = f"{s.sessionId[:8]} — {get_session_display_name(s)[:30]}"
             buttons.append([InlineKeyboardButton(btn_label, callback_data=f"switch:{s.sessionId}")])
@@ -912,15 +968,97 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(watch_active_sessions())
 
 
-def _chdir_to_session(meta) -> None:
-    """Change the process working directory to the session's cwd.
+def _snapshot_session_context(meta) -> dict[str, str]:
+    """Capture context fields that are persisted in workspace.yaml."""
+    if meta is None:
+        return {}
+    ctx = getattr(meta, "context", None)
+    if ctx is None:
+        return {}
 
-    The original cwd is saved in state._original_cwd and restored
-    when disconnecting from the session.
-    """
-    if meta and meta.context and meta.context.cwd:
-        target = meta.context.cwd
-        logger.info(f"Session CWD from metadata: {target}")
+    values = {
+        "cwd": getattr(ctx, "cwd", None),
+        "git_root": getattr(ctx, "gitRoot", None) or getattr(ctx, "git_root", None),
+        "repository": getattr(ctx, "repository", None),
+        "branch": getattr(ctx, "branch", None),
+    }
+    return {k: v for k, v in values.items() if isinstance(v, str) and v.strip()}
+
+
+def _load_db_session_context_map() -> dict[str, dict[str, str]]:
+    """Load persisted session context from ~/.copilot/session-store.db."""
+    db_path = Path.home() / ".copilot" / "session-store.db"
+    if not db_path.is_file():
+        return {}
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute("SELECT id, cwd, repository, branch FROM sessions")
+        rows = cur.fetchall()
+    except Exception as e:
+        logger.debug(f"Could not read session-store.db for cwd resolution: {e}")
+        rows = []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    result: dict[str, dict[str, str]] = {}
+    for sid, cwd, repository, branch in rows:
+        if not isinstance(sid, str) or not sid:
+            continue
+
+        ctx: dict[str, str] = {}
+        if isinstance(cwd, str) and cwd.strip():
+            cwd_norm = cwd.strip()
+            ctx["cwd"] = cwd_norm
+            ctx["git_root"] = cwd_norm
+        if isinstance(repository, str) and repository.strip():
+            ctx["repository"] = repository.strip()
+        if isinstance(branch, str) and branch.strip():
+            ctx["branch"] = branch.strip()
+
+        if ctx:
+            result[sid] = ctx
+
+    return result
+
+
+def _resolve_session_context(
+    session_id: str,
+    meta=None,
+    db_contexts: Optional[dict[str, dict[str, str]]] = None,
+) -> dict[str, str]:
+    """Resolve session context with DB values taking precedence over live metadata."""
+    resolved = _snapshot_session_context(meta)
+    sid = session_id or getattr(meta, "sessionId", "")
+
+    if db_contexts is None:
+        db_contexts = _load_db_session_context_map()
+
+    db_ctx = db_contexts.get(sid, {}) if sid else {}
+    for key in ("cwd", "git_root", "repository", "branch"):
+        value = db_ctx.get(key)
+        if isinstance(value, str) and value.strip():
+            resolved[key] = value
+
+    if "git_root" not in resolved and resolved.get("cwd"):
+        resolved["git_root"] = resolved["cwd"]
+
+    return resolved
+
+
+def _chdir_to_session(meta, session_id: Optional[str] = None) -> None:
+    """Change process cwd to the resolved session cwd (DB override + metadata fallback)."""
+    sid = session_id or getattr(meta, "sessionId", "")
+    resolved = _resolve_session_context(sid, meta)
+    target = resolved.get("cwd")
+    if target:
+        logger.info(f"Session CWD resolved: {target}")
         if os.path.isdir(target):
             # Save current dir before switching (if not already saved)
             try:
@@ -935,6 +1073,68 @@ def _chdir_to_session(meta) -> None:
     else:
         cwd_val = getattr(getattr(meta, 'context', None), 'cwd', None) if meta else None
         logger.info(f"No CWD in session metadata (meta={meta is not None}, cwd={cwd_val})")
+
+
+def _restore_workspace_context(session_id: str, context: dict[str, str], reason: str) -> bool:
+    """Restore workspace.yaml context fields after SDK resume mutations."""
+    if not context:
+        return False
+
+    workspace_path = Path.home() / ".copilot" / "session-state" / session_id / "workspace.yaml"
+    if not workspace_path.is_file():
+        return False
+
+    try:
+        original = workspace_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    lines = original.splitlines()
+    changed = False
+
+    def _normalized(value: str) -> str:
+        val = value.strip()
+        if len(val) >= 2 and val.startswith('"') and val.endswith('"'):
+            val = val[1:-1]
+        return val
+
+    for key in ("cwd", "git_root", "repository", "branch"):
+        desired = context.get(key)
+        if not desired:
+            continue
+
+        idx = -1
+        current = None
+        prefix = f"{key}:"
+        for i, line in enumerate(lines):
+            if line.startswith(prefix):
+                idx = i
+                current = line.split(":", 1)[1]
+                break
+
+        if idx >= 0:
+            if _normalized(current or "") != desired:
+                lines[idx] = f"{key}: {desired}"
+                changed = True
+        else:
+            lines.append(f"{key}: {desired}")
+            changed = True
+
+    if not changed:
+        return False
+
+    rendered = "\n".join(lines)
+    if original.endswith("\n"):
+        rendered += "\n"
+    try:
+        workspace_path.write_text(rendered, encoding="utf-8")
+        logger.info(
+            f"Restored workspace context for session {session_id[:8]} after {reason}"
+        )
+        return True
+    except OSError as e:
+        logger.warning(f"Failed to restore workspace context for {session_id[:8]}: {e}")
+        return False
 
 
 def _repair_session_file(session_id: str) -> bool:
@@ -1086,9 +1286,14 @@ async def _do_resume(session_id: str, chat_id: int, pre_meta=None) -> tuple:
     """
     async with state._lock:
         client = await ensure_client()
+        pre_context = _resolve_session_context(session_id, pre_meta)
+        resume_cwd = pre_context.get("cwd")
 
         if state.current_session:
             await _disconnect_session()
+        # Background watches keep extra resumed sessions alive and can race with
+        # foreground switching on the shared SDK client.
+        await _clear_background_watchers()
 
         # Pre-repair: fix known corruption before attempting resume
         _repair_session_file(session_id)
@@ -1096,10 +1301,35 @@ async def _do_resume(session_id: str, chat_id: int, pre_meta=None) -> tuple:
         session = await client.resume_session(
             session_id,
             on_permission_request=PermissionHandler.approve_all,
+            working_directory=resume_cwd,
         )
+        resumed_session_id = getattr(session, "session_id", None)
+        if resumed_session_id and resumed_session_id != session_id:
+            logger.warning(
+                "Resume returned %s for requested %s — retrying with fresh client",
+                resumed_session_id[:8],
+                session_id[:8],
+            )
+            try:
+                await client.stop()
+            except Exception:
+                pass
+            state.client = None
+            client = await ensure_client()
+            session = await client.resume_session(
+                session_id,
+                on_permission_request=PermissionHandler.approve_all,
+                working_directory=resume_cwd,
+            )
+            resumed_session_id = getattr(session, "session_id", None)
+            if resumed_session_id and resumed_session_id != session_id:
+                raise RuntimeError(
+                    f"SDK resumed {resumed_session_id[:8]} while switching to {session_id[:8]}"
+                )
+        _restore_workspace_context(session_id, pre_context, reason="foreground resume")
 
         state.current_session = session
-        state.current_session_id = session_id
+        state.current_session_id = resumed_session_id or session_id
         state.event_chat_id = chat_id
         state.unsubscribe_fn = session.on(on_session_event)
 
@@ -1122,7 +1352,7 @@ async def _do_resume(session_id: str, chat_id: int, pre_meta=None) -> tuple:
                 pass
         state.current_session_meta = meta
 
-        _chdir_to_session(meta)
+        _chdir_to_session(meta, state.current_session_id)
         return session, meta
 
 
@@ -1176,9 +1406,10 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         meta = meta or match
 
         summary = escape((meta.summary if meta else None) or "—")
+        resolved = _resolve_session_context(match.sessionId, meta)
         cwd = ""
-        if meta and meta.context and meta.context.cwd:
-            cwd = f"\n📁 <code>{escape(meta.context.cwd)}</code>"
+        if resolved.get("cwd"):
+            cwd = f"\n📁 <code>{escape(resolved['cwd'])}</code>"
 
         await update.message.reply_text(
             f"✅ Connected to session <code>{match.sessionId[:8]}</code>\n"
@@ -1209,18 +1440,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.current_session is not None and state.current_session_meta:
         try:
             meta = state.current_session_meta
+            resolved = _resolve_session_context(meta.sessionId, meta)
             lines.append("📊 <b>Current Session</b>\n")
             lines.append(f"<b>ID:</b> <code>{meta.sessionId}</code>")
             lines.append(f"<b>Summary:</b> {escape(meta.summary or '—')}")
             lines.append(f"<b>Modified:</b> {format_time_ago(meta.modifiedTime)}")
 
-            if meta.context:
-                if meta.context.cwd:
-                    lines.append(f"<b>CWD:</b> <code>{escape(meta.context.cwd)}</code>")
-                if meta.context.repository:
-                    lines.append(f"<b>Repo:</b> {escape(meta.context.repository)}")
-                if meta.context.branch:
-                    lines.append(f"<b>Branch:</b> {escape(meta.context.branch)}")
+            if resolved.get("cwd"):
+                lines.append(f"<b>CWD:</b> <code>{escape(resolved['cwd'])}</code>")
+            if resolved.get("repository"):
+                lines.append(f"<b>Repo:</b> {escape(resolved['repository'])}")
+            if resolved.get("branch"):
+                lines.append(f"<b>Branch:</b> {escape(resolved['branch'])}")
 
             try:
                 messages = await state.current_session.get_messages()
@@ -1526,9 +1757,10 @@ async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, meta = await _do_resume(session_id, query.message.chat_id, pre_meta=pre_meta)
 
         summary = escape((meta.summary if meta else None) or "—")
+        resolved = _resolve_session_context(session_id, meta)
         cwd = ""
-        if meta and meta.context and meta.context.cwd:
-            cwd = f"\n📁 <code>{escape(meta.context.cwd)}</code>"
+        if resolved.get("cwd"):
+            cwd = f"\n📁 <code>{escape(resolved['cwd'])}</code>"
 
         await query.edit_message_text(
             f"✅ Connected to session <code>{session_id[:8]}</code>\n"
@@ -1777,31 +2009,56 @@ async def _read_pinned_coordination(bot) -> Optional[dict]:
 
 async def _update_coordination_pin(bot, active: str, target: str, sessions: int = 0):
     """Update (or create) the pinned coordination message."""
+    if not state._coordination_chat_id:
+        logger.debug("Coordination chat is not set; skipping pin update")
+        return
+
     text = _build_coord_message(active, target, sessions)
     try:
-        if state._pinned_message_id:
-            # Edit existing message
-            await bot.edit_message_text(
-                text=text,
-                chat_id=state._coordination_chat_id,
-                message_id=state._pinned_message_id,
-            )
-        else:
-            # Send new message and pin it
-            msg = await bot.send_message(
-                chat_id=state._coordination_chat_id,
-                text=text,
-            )
-            state._pinned_message_id = msg.message_id
-            _save_coordination_state()
+        if not state._pinned_message_id:
+            # Reuse any existing pinned coordination message from another device/process.
             try:
-                await bot.pin_chat_message(
-                    chat_id=state._coordination_chat_id,
-                    message_id=msg.message_id,
-                    disable_notification=True,
-                )
+                chat = await bot.get_chat(state._coordination_chat_id)
+                pinned = chat.pinned_message
+                if pinned and pinned.text and _parse_coord_message(pinned.text):
+                    state._pinned_message_id = pinned.message_id
+                    _save_coordination_state()
             except Exception as e:
-                logger.warning(f"Could not pin coordination message: {e}")
+                logger.debug(f"Could not inspect existing pinned message: {e}")
+
+        if state._pinned_message_id:
+            try:
+                await bot.edit_message_text(
+                    text=text,
+                    chat_id=state._coordination_chat_id,
+                    message_id=state._pinned_message_id,
+                )
+                return
+            except telegram.error.BadRequest as e:
+                reason = str(e).lower()
+                if "message is not modified" in reason:
+                    return
+                logger.warning(
+                    f"Stored coordination pin could not be edited ({e}); creating a new pin"
+                )
+                state._pinned_message_id = None
+                _save_coordination_state()
+
+        # Send new message and pin it
+        msg = await bot.send_message(
+            chat_id=state._coordination_chat_id,
+            text=text,
+        )
+        state._pinned_message_id = msg.message_id
+        _save_coordination_state()
+        try:
+            await bot.pin_chat_message(
+                chat_id=state._coordination_chat_id,
+                message_id=msg.message_id,
+                disable_notification=True,
+            )
+        except Exception as e:
+            logger.warning(f"Could not pin coordination message: {e}")
     except Exception as e:
         logger.error(f"Failed to update coordination pin: {e}")
 
@@ -1852,6 +2109,8 @@ def _save_coordination_state():
         data["chat_id"] = state._coordination_chat_id
         if state._pinned_message_id:
             data["pinned_message_id"] = state._pinned_message_id
+        else:
+            data.pop("pinned_message_id", None)
         COORD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         COORD_STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception as e:
@@ -1991,6 +2250,13 @@ async def _active_post_init(application: Application):
     state.is_active = True
     logger.info("Telegram bot initialized (ACTIVE)")
 
+    # Immediately claim/update coordination when this device becomes active.
+    if state._coordination_chat_id:
+        sessions = await _get_session_count()
+        await _update_coordination_pin(
+            application.bot, state.device_name, state.device_name, sessions
+        )
+
     # Start heartbeat task
     state._heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
@@ -2008,13 +2274,7 @@ async def _active_post_shutdown(application: Application):
             pass
         state._heartbeat_task = None
 
-    # Unsubscribe all background watchers
-    for watched in state.watched_sessions.values():
-        try:
-            watched.unsub()
-        except Exception:
-            pass
-    state.watched_sessions.clear()
+    await _clear_background_watchers()
 
     await _disconnect_session()
     if state.client:
@@ -2121,7 +2381,7 @@ def main():
         state._coordination_chat_id = config["coordination_chat_id"]
 
     # Main active/standby loop
-    _conflict_backoff = 0  # seconds to wait after a Conflict before retrying
+    _conflict_backoff = 0  # seconds to wait before retrying active mode
     while True:
         # Check if we should start as active or standby
         should_be_active = asyncio.run(_check_should_activate(token))
@@ -2129,23 +2389,45 @@ def main():
         if should_be_active and _conflict_backoff == 0:
             state.is_active = True
             logger.info("Starting in ACTIVE mode")
-            _run_active(token, config)
+            try:
+                _run_active(token, config)
+            except KeyboardInterrupt:
+                logger.info("Active mode interrupted")
+                break
+            except telegram.error.RetryAfter as e:
+                retry_after = int(getattr(e, "retry_after", STANDBY_CHECK_INTERVAL) or STANDBY_CHECK_INTERVAL)
+                _conflict_backoff = max(retry_after, STANDBY_CHECK_INTERVAL)
+                state.is_active = False
+                logger.warning(
+                    f"Telegram rate-limited startup; retrying after {retry_after}s in standby"
+                )
+            except telegram.error.TimedOut as e:
+                state.is_active = False
+                logger.warning(
+                    f"Timed out while bootstrapping Telegram polling ({e}) — entering standby"
+                )
+            except telegram.error.NetworkError as e:
+                state.is_active = False
+                logger.warning(
+                    f"Network error while bootstrapping Telegram polling ({e}) — entering standby"
+                )
             # If we get here, polling stopped (handoff, conflict, or error)
             logger.info("Active polling ended")
             if not state.is_active:
                 # Conflict or handoff — wait before retrying
-                _conflict_backoff = STANDBY_CHECK_INTERVAL
+                if _conflict_backoff == 0:
+                    _conflict_backoff = STANDBY_CHECK_INTERVAL
                 logger.info(f"Will enter standby for {_conflict_backoff}s before retrying")
             state.is_active = False
         else:
-            _conflict_backoff = 0  # reset for next cycle
             logger.info("Starting in STANDBY mode")
             # Run standby loop — blocks until we should activate
             try:
-                asyncio.run(_run_standby(token))
+                asyncio.run(_run_standby(token, initial_delay=_conflict_backoff))
             except KeyboardInterrupt:
                 logger.info("Standby interrupted")
                 break
+            _conflict_backoff = 0  # reset for next cycle
 
 
 async def _check_should_activate(token: str) -> bool:
@@ -2195,20 +2477,20 @@ async def _check_should_activate(token: str) -> bool:
         return True  # If we can't check, try active
 
 
-async def _run_standby(token: str):
+async def _run_standby(token: str, initial_delay: int = 0):
     """Run in standby mode, checking pinned message until activation."""
-    from telegram import Bot
-    bot = Bot(token)
+    if initial_delay > 0:
+        logger.info(f"Standby backoff — waiting {initial_delay}s before activation checks")
+        await asyncio.sleep(initial_delay)
 
     logger.info(f"Standby mode — checking every {STANDBY_CHECK_INTERVAL}s for activation")
 
     while True:
-        await asyncio.sleep(STANDBY_CHECK_INTERVAL)
-
         should = await _check_should_activate(token)
         if should:
             logger.info("Activation condition met — switching to active")
             return  # Return to main loop which will start active
+        await asyncio.sleep(STANDBY_CHECK_INTERVAL)
 
 
 def _run_active(token: str, config: dict):
