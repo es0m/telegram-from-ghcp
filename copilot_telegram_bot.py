@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "github-copilot-sdk>=0.1.0",
+#     "github-copilot-sdk>=1.0.0",
 #     "python-telegram-bot>=22.0",
 #     # faster-whisper is optional — auto-enabled on x64, off on arm64
 #     # Install manually: pip install faster-whisper>=1.1.0
@@ -74,7 +74,7 @@ from typing import Any, Optional
 from copilot import (
     CopilotClient,
     CopilotSession,
-    SubprocessConfig,
+    RuntimeConnection,
 )
 from copilot.session import PermissionHandler
 from copilot.client import (
@@ -135,11 +135,14 @@ def classify_session(meta, now: datetime = None) -> str:
     """
     if now is None:
         now = datetime.now(timezone.utc)
-    mod_time = meta.modifiedTime
+    mod_time = getattr(meta, "modified_time", None)
     if not mod_time:
         return "stale"
     try:
-        mod = datetime.fromisoformat(mod_time.replace("Z", "+00:00"))
+        if isinstance(mod_time, datetime):
+            mod = mod_time if mod_time.tzinfo else mod_time.replace(tzinfo=timezone.utc)
+        else:
+            mod = datetime.fromisoformat(mod_time.replace("Z", "+00:00"))
         age = now - mod
         if age < timedelta(days=1):
             return "active"
@@ -161,7 +164,7 @@ def get_session_display_name(meta, device_name: str = "") -> str:
       4. Session ID prefix
     """
     name = ""
-    session_id = getattr(meta, "sessionId", "")
+    session_id = getattr(meta, "session_id", "")
     resolved = _resolve_session_context(session_id, meta)
 
     # 1. Summary
@@ -188,7 +191,7 @@ def get_session_display_name(meta, device_name: str = "") -> str:
 
     # 4. Fallback to session ID prefix
     if not name:
-        name = meta.sessionId[:8]
+        name = meta.session_id[:8]
 
     # Prefix with device name if available
     if device_name:
@@ -272,10 +275,18 @@ def truncate(text: str, max_len: int = 4000) -> str:
     return text[: max_len - 20] + "\n\n…(truncated)"
 
 
-def format_time_ago(iso_time: str) -> str:
-    """Convert ISO timestamp to human-readable relative time."""
+def format_time_ago(ts) -> str:
+    """Convert ISO timestamp string or datetime to human-readable relative time.
+
+    SDK 0.x returned ISO strings; SDK 1.x returns datetime objects directly.
+    """
     try:
-        dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+        if isinstance(ts, datetime):
+            dt = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        elif isinstance(ts, str) and ts:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        else:
+            return "unknown"
         delta = datetime.now(timezone.utc) - dt
         secs = int(delta.total_seconds())
         if secs < 60:
@@ -288,7 +299,31 @@ def format_time_ago(iso_time: str) -> str:
             return f"{hours}h ago"
         return f"{hours // 24}d ago"
     except Exception:
-        return iso_time[:19] if iso_time else "unknown"
+        return str(ts)[:19] if ts else "unknown"
+
+
+def _modified_time_sort_key(meta):
+    """Return a sort key for SessionMetadata.modified_time that tolerates None."""
+    v = getattr(meta, "modified_time", None)
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        return v.isoformat()
+    return str(v)
+
+
+def _coerce_modified_time(v):
+    """Normalize a SessionMetadata.modified_time value to an aware datetime, or None."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    if isinstance(v, str) and v:
+        try:
+            return datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    return None
 
 
 # ── Bot State ────────────────────────────────────────────────────────────────
@@ -387,37 +422,31 @@ def _ensure_coordination_chat(update: Update) -> None:
 async def ensure_client() -> CopilotClient:
     """Ensure the Copilot client is started and connected."""
     if state.client is not None:
-        # Check if existing client is still healthy
-        try:
-            if state.client.get_state() != "connected":
-                logger.warning("Client in bad state, restarting...")
-                try:
-                    await state.client.stop()
-                except Exception:
-                    pass
-                state.client = None
-        except Exception:
-            state.client = None
+        # SDK 1.0 removed get_state(); rely on the client being alive
+        # and trust that resume/list calls will raise on bad state. The
+        # error handler below will set state.client = None on failures.
+        return state.client
 
-    if state.client is None:
-        cli_path = state.config.get("copilot_cli_path", "copilot")
-        log_level = state.config.get("copilot_log_level", "none")
+    cli_path = state.config.get("copilot_cli_path", "copilot")
+    log_level = state.config.get("copilot_log_level", "none")
 
-        # The SDK checks os.path.exists() but doesn't resolve PATH lookups,
-        # so we resolve it here.
-        resolved = shutil.which(cli_path)
-        if resolved:
-            cli_path = resolved
+    # The SDK checks os.path.exists() but doesn't resolve PATH lookups,
+    # so we resolve it here.
+    resolved = shutil.which(cli_path)
+    if resolved:
+        cli_path = resolved
 
-        options = SubprocessConfig(
-            cli_path=cli_path,
-            log_level=log_level,
-            cli_args=["--allow-all"],
-        )
-        state.client = CopilotClient(options)
-        logger.info("Starting Copilot headless server...")
-        await state.client.start()
-        logger.info("Copilot headless server started")
+    connection = RuntimeConnection.for_stdio(
+        path=cli_path,
+        args=["--allow-all"],
+    )
+    state.client = CopilotClient(
+        connection=connection,
+        log_level=log_level,
+    )
+    logger.info("Starting Copilot headless server...")
+    await state.client.start()
+    logger.info("Copilot headless server started")
 
     return state.client
 
@@ -542,17 +571,14 @@ async def watch_active_sessions():
             cutoff = datetime.now(timezone.utc) - timedelta(days=1)
 
             for s in sessions:
-                sid = s.sessionId
+                sid = s.session_id
                 # Skip if already watching or is the current session
                 if sid in state.watched_sessions or sid == state.current_session_id:
                     continue
-                if not s.modifiedTime:
+                if not s.modified_time:
                     continue
-                try:
-                    mod = datetime.fromisoformat(s.modifiedTime.replace("Z", "+00:00"))
-                    if mod < cutoff:
-                        continue
-                except Exception:
+                mod = _coerce_modified_time(s.modified_time)
+                if mod is None or mod < cutoff:
                     continue
 
                 # Resume and subscribe
@@ -753,13 +779,13 @@ def _format_session_line(
     db_contexts: Optional[dict[str, dict[str, str]]] = None,
 ) -> str:
     """Format a single session as a Telegram HTML line."""
-    sid_short = s.sessionId[:8]
+    sid_short = s.session_id[:8]
     display = get_session_display_name(s, device_name="")
     # Check for user-assigned name override
-    if s.sessionId in state.session_display_names:
-        display = state.session_display_names[s.sessionId]
-    age = format_time_ago(s.modifiedTime)
-    resolved = _resolve_session_context(s.sessionId, s, db_contexts=db_contexts)
+    if s.session_id in state.session_display_names:
+        display = state.session_display_names[s.session_id]
+    age = format_time_ago(s.modified_time)
+    resolved = _resolve_session_context(s.session_id, s, db_contexts=db_contexts)
 
     cwd_line = ""
     if resolved.get("cwd"):
@@ -801,7 +827,7 @@ async def _list_sessions_grouped(
 
         # Sort each group by modified time descending
         for g in groups.values():
-            g.sort(key=lambda s: s.modifiedTime or "", reverse=True)
+            g.sort(key=_modified_time_sort_key, reverse=True)
 
         # Determine which groups to show
         if stale_only:
@@ -836,7 +862,7 @@ async def _list_sessions_grouped(
                 continue
             lines.append(f"\n<b>{label}</b> ({len(group)})")
             for s in group[:15]:  # Cap per group
-                is_current = s.sessionId == state.current_session_id
+                is_current = s.session_id == state.current_session_id
                 lines.append(
                     _format_session_line(
                         s,
@@ -846,9 +872,9 @@ async def _list_sessions_grouped(
                     )
                 )
 
-                btn_label = f"{s.sessionId[:8]} — {get_session_display_name(s)[:30]}"
+                btn_label = f"{s.session_id[:8]} — {get_session_display_name(s)[:30]}"
                 buttons.append([InlineKeyboardButton(
-                    btn_label, callback_data=f"switch:{s.sessionId}"
+                    btn_label, callback_data=f"switch:{s.session_id}"
                 )])
                 count += 1
                 if count >= 30:
@@ -918,15 +944,11 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         recent = []
         for s in sessions:
-            if s.modifiedTime:
-                try:
-                    mod = datetime.fromisoformat(s.modifiedTime.replace("Z", "+00:00"))
-                    if mod >= cutoff:
-                        recent.append(s)
-                except Exception:
-                    pass
+            mod = _coerce_modified_time(s.modified_time)
+            if mod is not None and mod >= cutoff:
+                recent.append(s)
 
-        recent.sort(key=lambda s: s.modifiedTime or "", reverse=True)
+        recent.sort(key=_modified_time_sort_key, reverse=True)
 
         if not recent:
             await update.message.reply_text(f"No sessions active in the last {days} day(s).")
@@ -935,7 +957,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"📋 <b>Active Sessions on {escape(state.device_name)}</b> (last {days}d): {len(recent)}\n"]
         buttons = []
         for s in recent[:20]:
-            is_current = s.sessionId == state.current_session_id
+            is_current = s.session_id == state.current_session_id
             lines.append(
                 _format_session_line(
                     s,
@@ -945,8 +967,8 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
 
-            btn_label = f"{s.sessionId[:8]} — {get_session_display_name(s)[:30]}"
-            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"switch:{s.sessionId}")])
+            btn_label = f"{s.session_id[:8]} — {get_session_display_name(s)[:30]}"
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"switch:{s.session_id}")])
 
         if len(recent) > 20:
             lines.append(f"\n<i>...and {len(recent) - 20} more</i>")
@@ -977,8 +999,8 @@ def _snapshot_session_context(meta) -> dict[str, str]:
         return {}
 
     values = {
-        "cwd": getattr(ctx, "cwd", None),
-        "git_root": getattr(ctx, "gitRoot", None) or getattr(ctx, "git_root", None),
+        "cwd": getattr(ctx, "working_directory", None),
+        "git_root": getattr(ctx, "git_root", None),
         "repository": getattr(ctx, "repository", None),
         "branch": getattr(ctx, "branch", None),
     }
@@ -1035,7 +1057,7 @@ def _resolve_session_context(
 ) -> dict[str, str]:
     """Resolve session context with DB values taking precedence over live metadata."""
     resolved = _snapshot_session_context(meta)
-    sid = session_id or getattr(meta, "sessionId", "")
+    sid = session_id or getattr(meta, "session_id", "")
 
     if db_contexts is None:
         db_contexts = _load_db_session_context_map()
@@ -1054,7 +1076,7 @@ def _resolve_session_context(
 
 def _chdir_to_session(meta, session_id: Optional[str] = None) -> None:
     """Change process cwd to the resolved session cwd (DB override + metadata fallback)."""
-    sid = session_id or getattr(meta, "sessionId", "")
+    sid = session_id or getattr(meta, "session_id", "")
     resolved = _resolve_session_context(sid, meta)
     target = resolved.get("cwd")
     if target:
@@ -1347,7 +1369,7 @@ async def _do_resume(session_id: str, chat_id: int, pre_meta=None) -> tuple:
         if meta is None:
             try:
                 sessions = await client.list_sessions()
-                meta = next((s for s in sessions if s.sessionId == session_id), None)
+                meta = next((s for s in sessions if s.session_id == session_id), None)
             except Exception:
                 pass
         state.current_session_meta = meta
@@ -1380,7 +1402,7 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sessions = await client.list_sessions()
         match = None
         for s in sessions:
-            if s.sessionId.lower().startswith(target_prefix):
+            if s.session_id.lower().startswith(target_prefix):
                 if match is not None:
                     await update.message.reply_text(
                         f"❌ Ambiguous prefix <code>{escape(target_prefix)}</code> — "
@@ -1398,21 +1420,21 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(
-            f"⏳ Connecting to session <code>{match.sessionId[:8]}</code>...",
+            f"⏳ Connecting to session <code>{match.session_id[:8]}</code>...",
             parse_mode=ParseMode.HTML,
         )
 
-        _, meta = await _do_resume(match.sessionId, update.effective_chat.id, pre_meta=match)
+        _, meta = await _do_resume(match.session_id, update.effective_chat.id, pre_meta=match)
         meta = meta or match
 
         summary = escape((meta.summary if meta else None) or "—")
-        resolved = _resolve_session_context(match.sessionId, meta)
+        resolved = _resolve_session_context(match.session_id, meta)
         cwd = ""
         if resolved.get("cwd"):
             cwd = f"\n📁 <code>{escape(resolved['cwd'])}</code>"
 
         await update.message.reply_text(
-            f"✅ Connected to session <code>{match.sessionId[:8]}</code>\n"
+            f"✅ Connected to session <code>{match.session_id[:8]}</code>\n"
             f"📝 {summary}{cwd}\n\n"
             f"Session events will be forwarded here.\n"
             f"Use /send &lt;message&gt; to interact.",
@@ -1440,11 +1462,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.current_session is not None and state.current_session_meta:
         try:
             meta = state.current_session_meta
-            resolved = _resolve_session_context(meta.sessionId, meta)
+            resolved = _resolve_session_context(meta.session_id, meta)
             lines.append("📊 <b>Current Session</b>\n")
-            lines.append(f"<b>ID:</b> <code>{meta.sessionId}</code>")
+            lines.append(f"<b>ID:</b> <code>{meta.session_id}</code>")
             lines.append(f"<b>Summary:</b> {escape(meta.summary or '—')}")
-            lines.append(f"<b>Modified:</b> {format_time_ago(meta.modifiedTime)}")
+            lines.append(f"<b>Modified:</b> {format_time_ago(meta.modified_time)}")
 
             if resolved.get("cwd"):
                 lines.append(f"<b>CWD:</b> <code>{escape(resolved['cwd'])}</code>")
@@ -1454,7 +1476,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"<b>Branch:</b> {escape(resolved['branch'])}")
 
             try:
-                messages = await state.current_session.get_messages()
+                messages = await state.current_session.get_events()
                 lines.append(f"<b>Events:</b> {len(messages)}")
             except Exception:
                 pass
@@ -1547,8 +1569,6 @@ async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _disconnect_session():
     """Internal: disconnect from the current session and restore original cwd."""
-    session_id = state.current_session_id
-
     if state.unsubscribe_fn:
         try:
             state.unsubscribe_fn()
@@ -1562,12 +1582,6 @@ async def _disconnect_session():
         except Exception:
             pass
 
-    # Clean up inuse lock file left by the headless CLI process.
-    # The SDK's disconnect() doesn't remove it, so the CLI warns
-    # "in use by another CLI" for sessions we've already released.
-    if session_id:
-        _cleanup_inuse_lock(session_id)
-
     state.current_session = None
     state.current_session_id = None
     state.current_session_meta = None
@@ -1580,29 +1594,6 @@ async def _disconnect_session():
             logger.info(f"Restored working directory to {state._original_cwd}")
         except OSError:
             pass
-
-
-def _cleanup_inuse_lock(session_id: str):
-    """Remove inuse.<PID>.lock for our headless CLI process."""
-    cli_pid = None
-    try:
-        if state.client and state.client._process:
-            cli_pid = state.client._process.pid
-    except Exception:
-        pass
-    if not cli_pid:
-        return
-
-    session_dir = os.path.expanduser(
-        f"~/.copilot/session-state/{session_id}"
-    )
-    lock_file = os.path.join(session_dir, f"inuse.{cli_pid}.lock")
-    try:
-        if os.path.exists(lock_file):
-            os.remove(lock_file)
-            logger.info(f"Removed lock file: {lock_file}")
-    except OSError as e:
-        logger.debug(f"Could not remove lock file {lock_file}: {e}")
 
 
 async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1729,7 +1720,7 @@ async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(session_id) < 36:
             client = await ensure_client()
             sessions = await client.list_sessions()
-            matches = [s for s in sessions if s.sessionId.lower().startswith(session_id.lower())]
+            matches = [s for s in sessions if s.session_id.lower().startswith(session_id.lower())]
             if len(matches) == 0:
                 await query.edit_message_text(
                     f"❌ No session matching <code>{escape(session_id)}</code>",
@@ -1742,7 +1733,7 @@ async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML,
                 )
                 return
-            session_id = matches[0].sessionId
+            session_id = matches[0].session_id
             pre_meta = matches[0]
         else:
             # Full session ID — fetch metadata before resume
@@ -1750,7 +1741,7 @@ async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 client = await ensure_client()
                 sessions = await client.list_sessions()
-                pre_meta = next((s for s in sessions if s.sessionId == session_id), None)
+                pre_meta = next((s for s in sessions if s.session_id == session_id), None)
             except Exception:
                 pass
 

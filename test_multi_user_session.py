@@ -13,7 +13,7 @@ Uses the Python Copilot SDK to:
 
 Requires:
   - copilot CLI installed and on PATH
-  - github-copilot-sdk >= 0.1.0
+  - github-copilot-sdk >= 1.0.0
   - pytest, pytest-asyncio
 
 Run:
@@ -57,9 +57,9 @@ class TestClassifySession:
     """Test the classify_session helper."""
 
     def _make_meta(self, modified_iso: str):
-        """Create a mock SessionMetadata with the given modifiedTime."""
+        """Create a mock SessionMetadata with the given modified_time."""
         meta = MagicMock()
-        meta.modifiedTime = modified_iso
+        meta.modified_time = modified_iso
         return meta
 
     def test_active_within_24h(self):
@@ -94,10 +94,14 @@ class TestGetSessionDisplayName:
     def _make_meta(self, summary=None, repo=None, cwd=None, session_id="abcd1234-0000"):
         meta = MagicMock()
         meta.summary = summary
-        meta.sessionId = session_id
+        meta.session_id = session_id
         meta.context = MagicMock()
         meta.context.repository = repo
+        meta.context.working_directory = cwd
+        # Also set the legacy attribute so DB-context resolution stays consistent
         meta.context.cwd = cwd
+        meta.context.git_root = cwd
+        meta.context.branch = None
         return meta
 
     def test_summary_first(self):
@@ -322,7 +326,7 @@ class TestCoordinationPinUpdates:
 copilot_available = shutil.which("copilot") is not None
 
 try:
-    from copilot import CopilotClient, SubprocessConfig
+    from copilot import CopilotClient, RuntimeConnection
     from copilot.session import PermissionHandler
     from copilot.generated.session_events import SessionEventType
     sdk_available = True
@@ -345,12 +349,11 @@ class TestMultiUserSession:
     async def _make_client(self) -> CopilotClient:
         """Create and start a CopilotClient."""
         cli_path = shutil.which("copilot") or "copilot"
-        options = SubprocessConfig(
-            cli_path=cli_path,
-            log_level="none",
-            cli_args=["--allow-all"],
+        connection = RuntimeConnection.for_stdio(
+            path=cli_path,
+            args=["--allow-all"],
         )
-        client = CopilotClient(options)
+        client = CopilotClient(connection=connection, log_level="none")
         await client.start()
         return client
 
@@ -363,8 +366,8 @@ class TestMultiUserSession:
             sessions_a = await client_a.list_sessions()
             sessions_b = await client_b.list_sessions()
 
-            ids_a = {s.sessionId for s in sessions_a}
-            ids_b = {s.sessionId for s in sessions_b}
+            ids_a = {s.session_id for s in sessions_a}
+            ids_b = {s.session_id for s in sessions_b}
 
             # Both clients read from the same session-state directory,
             # so their session lists must be identical.
@@ -387,7 +390,7 @@ class TestMultiUserSession:
                 pytest.skip("No existing sessions to test with")
 
             target = sessions[0]
-            sid = target.sessionId
+            sid = target.session_id
 
             # Client A resumes the session
             session_a = await client_a.resume_session(
@@ -408,13 +411,13 @@ class TestMultiUserSession:
             session_a.on(lambda e: events_a.append(e.type))
             session_b.on(lambda e: events_b.append(e.type))
 
-            # Both should be able to get messages (proves they're connected)
-            messages_a = await session_a.get_messages()
-            messages_b = await session_b.get_messages()
+            # Both should be able to get events (proves they're connected)
+            messages_a = await session_a.get_events()
+            messages_b = await session_b.get_events()
 
-            # Message lists should be the same (both are viewing the same session)
+            # Event lists should be the same (both are viewing the same session)
             assert len(messages_a) == len(messages_b), (
-                f"Message count differs: A={len(messages_a)}, B={len(messages_b)}"
+                f"Event count differs: A={len(messages_a)}, B={len(messages_b)}"
             )
 
             # Disconnect both
@@ -438,17 +441,17 @@ class TestMultiUserSession:
                 pytest.skip("No sessions available")
 
             # Build lookup for B
-            b_map = {s.sessionId: s for s in sessions_b}
+            b_map = {s.session_id: s for s in sessions_b}
 
             for sa in sessions_a[:5]:  # Check first 5
-                sb = b_map.get(sa.sessionId)
-                assert sb is not None, f"Session {sa.sessionId} not found in client B"
+                sb = b_map.get(sa.session_id)
+                assert sb is not None, f"Session {sa.session_id} not found in client B"
                 assert sa.summary == sb.summary, (
-                    f"Summary mismatch for {sa.sessionId}: '{sa.summary}' vs '{sb.summary}'"
+                    f"Summary mismatch for {sa.session_id}: '{sa.summary}' vs '{sb.summary}'"
                 )
-                assert sa.modifiedTime == sb.modifiedTime
+                assert sa.modified_time == sb.modified_time
                 if sa.context and sb.context:
-                    assert sa.context.cwd == sb.context.cwd
+                    assert sa.context.working_directory == sb.context.working_directory
         finally:
             await client_a.stop()
             await client_b.stop()
@@ -501,7 +504,7 @@ class TestMultiUserSession:
             async def _wait_for_listed_meta(session_id: str, timeout_seconds: int = 30):
                 for _ in range(timeout_seconds):
                     sessions = await client.list_sessions()
-                    match = next((s for s in sessions if s.sessionId == session_id), None)
+                    match = next((s for s in sessions if s.session_id == session_id), None)
                     if match is not None:
                         return match
                     await asyncio.sleep(1)
@@ -536,24 +539,24 @@ class TestMultiUserSession:
             target_meta = await _wait_for_listed_meta(target_session_id)
             if root_meta is None:
                 root_meta = SimpleNamespace(
-                    sessionId=root_session_id,
+                    session_id=root_session_id,
                     summary="root-session",
-                    modifiedTime=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    modified_time=datetime.now(timezone.utc),
                     context=SimpleNamespace(
-                        cwd=str(repo_root),
-                        gitRoot=str(repo_root),
+                        working_directory=str(repo_root),
+                        git_root=str(repo_root),
                         repository="es0m/telegram-from-ghcp",
                         branch="main",
                     ),
                 )
             if target_meta is None:
                 target_meta = SimpleNamespace(
-                    sessionId=target_session_id,
+                    session_id=target_session_id,
                     summary="target-session",
-                    modifiedTime=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    modified_time=datetime.now(timezone.utc),
                     context=SimpleNamespace(
-                        cwd=str(target_dir),
-                        gitRoot=str(target_dir),
+                        working_directory=str(target_dir),
+                        git_root=str(target_dir),
                         repository="es0m/telegram-from-ghcp",
                         branch="main",
                     ),
